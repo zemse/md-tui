@@ -13,7 +13,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "md-tui", version, about = "Markdown reader TUI with mouse + clickable links")]
+#[command(name = "md", version, about = "Markdown reader TUI with mouse + clickable links")]
 struct Cli {
     /// File or directory to view. If omitted and stdin is piped, reads stdin.
     /// If omitted with a TTY, browses the current directory.

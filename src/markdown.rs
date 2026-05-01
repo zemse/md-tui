@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -54,6 +54,12 @@ enum Block {
     Heading { runs: Vec<Run>, anchor: String },
     /// Pre-formatted block — rendered line-by-line, not wrapped.
     Pre { lines: Vec<Vec<Run>>, prefix: Vec<Run> },
+    /// Table — column-aligned with box-drawing borders.
+    Table {
+        alignments: Vec<Alignment>,
+        header: Vec<Vec<Run>>,
+        rows: Vec<Vec<Vec<Run>>>,
+    },
     /// Horizontal rule.
     Rule,
     /// Empty line.
@@ -89,8 +95,16 @@ struct Builder {
     // link state
     open_link: Option<usize>,
 
-    // table state (very basic)
-    in_table: bool,
+    // table state
+    table: Option<TableState>,
+}
+
+struct TableState {
+    alignments: Vec<Alignment>,
+    header: Vec<Vec<Run>>,
+    rows: Vec<Vec<Vec<Run>>>,
+    current_row: Vec<Vec<Run>>,
+    cell_start: usize,
 }
 
 struct PendingLink {
@@ -123,7 +137,7 @@ impl Builder {
             code_content: String::new(),
             in_code_block: false,
             open_link: None,
-            in_table: false,
+            table: None,
         }
     }
 
@@ -324,9 +338,21 @@ impl Builder {
                 };
                 self.cur_runs.push(Run { text: label, style, link: None });
             }
-            Tag::Table(_) => { self.in_table = true; }
+            Tag::Table(aligns) => {
+                self.table = Some(TableState {
+                    alignments: aligns,
+                    header: Vec::new(),
+                    rows: Vec::new(),
+                    current_row: Vec::new(),
+                    cell_start: 0,
+                });
+            }
             Tag::TableHead | Tag::TableRow => {}
-            Tag::TableCell => {}
+            Tag::TableCell => {
+                if let Some(t) = &mut self.table {
+                    t.cell_start = self.cur_runs.len();
+                }
+            }
             Tag::FootnoteDefinition(name) => {
                 let style = Style::default().fg(self.theme.muted).add_modifier(Modifier::BOLD);
                 self.cur_runs.push(Run {
@@ -407,18 +433,30 @@ impl Builder {
                 self.open_link = None;
             }
             TagEnd::Table => {
-                self.in_table = false;
-                self.blocks.push(Block::Blank);
+                if let Some(t) = self.table.take() {
+                    self.blocks.push(Block::Table {
+                        alignments: t.alignments,
+                        header: t.header,
+                        rows: t.rows,
+                    });
+                    self.blocks.push(Block::Blank);
+                }
             }
-            TagEnd::TableHead | TagEnd::TableRow => {
-                self.finish_paragraph();
+            TagEnd::TableHead => {
+                if let Some(t) = &mut self.table {
+                    t.header = std::mem::take(&mut t.current_row);
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(t) = &mut self.table {
+                    t.rows.push(std::mem::take(&mut t.current_row));
+                }
             }
             TagEnd::TableCell => {
-                self.cur_runs.push(Run {
-                    text: " │ ".to_string(),
-                    style: Style::default().fg(self.theme.muted),
-                    link: None,
-                });
+                if let Some(t) = &mut self.table {
+                    let cell: Vec<Run> = self.cur_runs.drain(t.cell_start..).collect();
+                    t.current_row.push(cell);
+                }
             }
             _ => {}
         }
@@ -494,6 +532,9 @@ fn layout(theme: &Theme, width: usize, blocks: Vec<Block>, links: Vec<PendingLin
                     &links,
                     &mut open_spans,
                 );
+            }
+            Block::Table { alignments, header, rows } => {
+                layout_table(theme, &alignments, &header, &rows, width, &mut out_lines, &mut out_links, &links);
             }
             Block::Pre { lines, prefix } => {
                 let pad_left = "  ";
@@ -924,6 +965,212 @@ impl StyleExt for Style {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Table layout: column-aligned with box-drawing borders.
+// ---------------------------------------------------------------------------
+
+fn layout_table(
+    theme: &Theme,
+    alignments: &[Alignment],
+    header: &[Vec<Run>],
+    rows: &[Vec<Vec<Run>>],
+    max_width: usize,
+    out_lines: &mut Vec<Line<'static>>,
+    out_links: &mut Vec<LinkSpan>,
+    links: &[PendingLink],
+) {
+    let n_cols = header.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if n_cols == 0 { return; }
+
+    let cell_w = |runs: &[Run]| -> usize { runs.iter().map(|r| r.text.width()).sum() };
+
+    let mut col_widths = vec![0usize; n_cols];
+    for (i, c) in header.iter().enumerate() {
+        if i < n_cols { col_widths[i] = col_widths[i].max(cell_w(c)); }
+    }
+    for row in rows {
+        for (i, c) in row.iter().enumerate() {
+            if i < n_cols { col_widths[i] = col_widths[i].max(cell_w(c)); }
+        }
+    }
+
+    // Constrain to terminal width: total = 1 + sum(w + 3).
+    let frame_overhead = 1 + 3 * n_cols;
+    let avail = max_width.saturating_sub(frame_overhead).max(n_cols);
+    let total: usize = col_widths.iter().sum();
+    if total > avail {
+        // Shrink widest columns proportionally to fit.
+        let scale = avail as f64 / total as f64;
+        for w in col_widths.iter_mut() {
+            *w = ((*w as f64) * scale).floor() as usize;
+            if *w == 0 { *w = 1; }
+        }
+    }
+
+    let border = Style::default().fg(theme.muted);
+
+    out_lines.push(border_line(&col_widths, '┌', '┬', '┐', border));
+    emit_row(theme, header, &col_widths, alignments, true, out_lines, out_links, links, border);
+    out_lines.push(border_line(&col_widths, '├', '┼', '┤', border));
+    for row in rows {
+        emit_row(theme, row, &col_widths, alignments, false, out_lines, out_links, links, border);
+    }
+    out_lines.push(border_line(&col_widths, '└', '┴', '┘', border));
+}
+
+fn border_line(col_widths: &[usize], left: char, mid: char, right: char, style: Style) -> Line<'static> {
+    let mut s = String::new();
+    s.push(left);
+    for (i, w) in col_widths.iter().enumerate() {
+        for _ in 0..(w + 2) { s.push('─'); }
+        s.push(if i + 1 < col_widths.len() { mid } else { right });
+    }
+    Line::from(Span::styled(s, style))
+}
+
+fn emit_row(
+    theme: &Theme,
+    row: &[Vec<Run>],
+    col_widths: &[usize],
+    alignments: &[Alignment],
+    is_header: bool,
+    out_lines: &mut Vec<Line<'static>>,
+    out_links: &mut Vec<LinkSpan>,
+    links: &[PendingLink],
+    border: Style,
+) {
+    let line = out_lines.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+
+    spans.push(Span::styled("│".to_string(), border));
+    col += 1;
+
+    let empty: Vec<Run> = Vec::new();
+
+    for (i, w) in col_widths.iter().enumerate() {
+        let cell = row.get(i).unwrap_or(&empty);
+        let align = alignments.get(i).copied().unwrap_or(Alignment::None);
+        let truncated = truncate_runs(cell, *w);
+        let cw: usize = truncated.iter().map(|r| r.text.width()).sum();
+        let extra = w.saturating_sub(cw);
+        let (lpad, rpad) = match align {
+            Alignment::Right => (extra, 0),
+            Alignment::Center => (extra / 2, extra - extra / 2),
+            _ => (0, extra),
+        };
+
+        // leading inner pad
+        spans.push(Span::raw(" ".to_string()));
+        col += 1;
+        if lpad > 0 {
+            spans.push(Span::raw(" ".repeat(lpad)));
+            col += lpad;
+        }
+
+        // cell content
+        emit_runs_tracking_links(&truncated, is_header, theme, &mut spans, &mut col, line, out_links, links);
+
+        if rpad > 0 {
+            spans.push(Span::raw(" ".repeat(rpad)));
+            col += rpad;
+        }
+        // trailing inner pad
+        spans.push(Span::raw(" ".to_string()));
+        col += 1;
+
+        spans.push(Span::styled("│".to_string(), border));
+        col += 1;
+    }
+
+    out_lines.push(Line::from(spans));
+}
+
+fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
+    let total: usize = runs.iter().map(|r| r.text.width()).sum();
+    if total <= max { return runs.to_vec(); }
+    let mut out: Vec<Run> = Vec::new();
+    let mut budget = max.saturating_sub(1); // reserve 1 for ellipsis
+    for run in runs {
+        let w = run.text.width();
+        if w <= budget {
+            out.push(run.clone());
+            budget -= w;
+        } else {
+            // Take chars up to budget.
+            let mut taken_w = 0usize;
+            let mut taken_bytes = 0usize;
+            for (i, ch) in run.text.char_indices() {
+                let cw = ch.to_string().width();
+                if taken_w + cw > budget { break; }
+                taken_w += cw;
+                taken_bytes = i + ch.len_utf8();
+            }
+            if taken_bytes > 0 {
+                out.push(Run {
+                    text: run.text[..taken_bytes].to_string(),
+                    style: run.style,
+                    link: run.link,
+                });
+            }
+            break;
+        }
+    }
+    out.push(Run {
+        text: "…".to_string(),
+        style: Style::default(),
+        link: None,
+    });
+    out
+}
+
+fn emit_runs_tracking_links(
+    runs: &[Run],
+    is_header: bool,
+    theme: &Theme,
+    spans: &mut Vec<Span<'static>>,
+    col: &mut usize,
+    line: usize,
+    out_links: &mut Vec<LinkSpan>,
+    links: &[PendingLink],
+) {
+    let mut current_link: Option<usize> = None;
+    let mut open_start: usize = *col;
+    for run in runs {
+        if run.link != current_link {
+            if let Some(li) = current_link {
+                if open_start < *col {
+                    out_links.push(LinkSpan {
+                        line,
+                        col_start: open_start,
+                        col_end: *col,
+                        target: links[li].target.clone(),
+                    });
+                }
+            }
+            current_link = run.link;
+            open_start = *col;
+        }
+        let mut style = run.style;
+        if is_header {
+            style = style.add_modifier(Modifier::BOLD).fg(theme.heading[1]);
+        }
+        let w = run.text.width();
+        spans.push(Span::styled(run.text.clone(), style));
+        *col += w;
+    }
+    if let Some(li) = current_link {
+        if open_start < *col {
+            out_links.push(LinkSpan {
+                line,
+                col_start: open_start,
+                col_end: *col,
+                target: links[li].target.clone(),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1201,33 @@ mod tests {
         let r = render(src, None, 12, &Theme::dark());
         // "one two three" (13) needs wrapping in ≤12-wide column.
         assert!(r.lines.len() > 2);
+    }
+
+    #[test]
+    fn renders_aligned_table() {
+        let src = "\
+| A | Bee |\n\
+| --- | --- |\n\
+| 1 | one |\n\
+| 22 | two |\n";
+        let r = render(src, None, 80, &Theme::dark());
+        // Find the header row; it should be a `│` framed row of fixed total width.
+        let mut frame_lines: Vec<String> = Vec::new();
+        for line in &r.lines {
+            let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            if s.starts_with('│') || s.starts_with('┌') || s.starts_with('├') || s.starts_with('└') {
+                frame_lines.push(s);
+            }
+        }
+        assert!(frame_lines.len() >= 6, "expected ≥6 framed lines, got {}", frame_lines.len());
+        // All framed lines must share the same display width — that's the alignment guarantee.
+        let widths: Vec<usize> = frame_lines.iter().map(|s| s.as_str().width()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "table frame widths not equal: {:?}\nlines:\n{}",
+            widths,
+            frame_lines.join("\n"),
+        );
     }
 
     #[test]
