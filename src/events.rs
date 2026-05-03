@@ -6,7 +6,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 
-use crate::app::{App, EntryKind, View};
+use crate::app::{self, App, BrowserEntry, BrowserEntryKind, EntryKind, SearchResult, View};
 use crate::ui;
 
 pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
@@ -17,7 +17,6 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
             Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k)?,
             Event::Mouse(m) => handle_mouse(app, m)?,
             Event::Resize(_, _) => {
-                // Force re-render at new width; cheap.
                 if let View::Reader(r) = &mut app.view {
                     r.rendered = None;
                 }
@@ -36,6 +35,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         return Ok(());
     }
+    if app.search.is_some() {
+        return handle_search_key(app, key);
+    }
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
@@ -50,6 +52,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char('?') => app.help_open = !app.help_open,
+        KeyCode::Char('/') => app.open_search(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
@@ -79,7 +82,80 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.close_search(),
+        KeyCode::Enter => {
+            let result = app
+                .search
+                .as_ref()
+                .and_then(|s| s.results.get(s.selected).cloned());
+            app.close_search();
+            if let Some(r) = result {
+                open_search_result(app, r)?;
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if let Some(s) = &mut app.search { s.move_selection(1); }
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            if let Some(s) = &mut app.search { s.move_selection(-1); }
+        }
+        KeyCode::PageDown => {
+            if let Some(s) = &mut app.search { s.move_selection(10); }
+        }
+        KeyCode::PageUp => {
+            if let Some(s) = &mut app.search { s.move_selection(-10); }
+        }
+        KeyCode::Backspace => {
+            if let Some(s) = &mut app.search {
+                s.query.pop();
+                s.refresh();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(s) = &mut app.search {
+                s.query.clear();
+                s.refresh();
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(s) = &mut app.search {
+                s.query.push(c);
+                s.refresh();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
+    if r.is_dir {
+        app.navigate_to(EntryKind::Directory(r.path), 0)?;
+    } else if app::is_markdown_file(&r.path) {
+        app.navigate_to(EntryKind::File(r.path), 0)?;
+    } else {
+        let _ = open::that_detached(&r.path);
+        app.status = format!("Opened externally: {}", r.path.display());
+    }
+    Ok(())
+}
+
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+    // While the search overlay is up, the mouse wheel scrolls results.
+    if app.search.is_some() {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(s) = &mut app.search { s.move_selection(-1); }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(s) = &mut app.search { s.move_selection(1); }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     let area = app.viewport;
     if !point_in(area, m.column, m.row) {
         match m.kind {
@@ -98,9 +174,6 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         MouseEventKind::Down(MouseButton::Left) => {
             click_at(app, m.column, m.row)?;
         }
-        // Some terminals send back/forward as buttons 4/5 mapped to extras —
-        // crossterm exposes them as MouseButton::Other variants only via raw flags;
-        // we keep keyboard h/l for now.
         _ => {}
     }
     Ok(())
@@ -115,7 +188,7 @@ fn scroll_by(app: &mut App, delta: i32) {
         View::Reader(r) => {
             let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0) as i32;
             let h = app.viewport.height as i32;
-            let max = (total - h).max(0) as i32;
+            let max = (total - h).max(0);
             let new = (r.scroll as i32 + delta).clamp(0, max) as u16;
             r.scroll = new;
             app.status.clear();
@@ -125,6 +198,7 @@ fn scroll_by(app: &mut App, delta: i32) {
             if n == 0 { return; }
             let new = (b.selected as i32 + delta).clamp(0, n - 1) as usize;
             b.selected = new;
+            // Keep selection visible. Account for the bordered title row.
             let h = app.viewport.height.saturating_sub(2) as usize;
             if b.selected < b.scroll as usize {
                 b.scroll = b.selected as u16;
@@ -205,13 +279,29 @@ fn activate(app: &mut App) -> Result<()> {
             Ok(())
         }
         View::Browser(b) => {
-            if let Some(p) = b.selected_path() {
-                let p = p.to_path_buf();
-                app.navigate_to(EntryKind::File(p), 0)?;
+            let entry = b.entries.get(b.selected).cloned();
+            if let Some(e) = entry {
+                activate_browser_entry(app, e)?;
             }
             Ok(())
         }
     }
+}
+
+fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
+    match entry.kind {
+        BrowserEntryKind::ParentDir | BrowserEntryKind::Dir => {
+            app.navigate_to(EntryKind::Directory(entry.path), 0)?;
+        }
+        BrowserEntryKind::Markdown => {
+            app.navigate_to(EntryKind::File(entry.path), 0)?;
+        }
+        BrowserEntryKind::Other => {
+            let _ = open::that_detached(&entry.path);
+            app.status = format!("Opened externally: {}", entry.path.display());
+        }
+    }
+    Ok(())
 }
 
 fn open_focused(app: &mut App) -> Result<()> {
@@ -248,7 +338,7 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
 
 fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
     let area = app.viewport;
-    match &mut app.view {
+    let entry_to_open = match &mut app.view {
         View::Reader(r) => {
             let Some(rendered) = &r.rendered else { return Ok(()); };
             let line_num_w = if app.opts.line_numbers {
@@ -264,17 +354,23 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 r.focused_link = Some(li);
                 app.follow(target)?;
             }
+            None
         }
         View::Browser(b) => {
             let local_row = (row - area.y) as usize;
-            // skip the bordered title row at index 0
-            let idx = local_row.saturating_sub(1) + b.scroll as usize;
+            // Row 0 is the bordered title; list rows start at 1.
+            let visual = local_row.saturating_sub(1);
+            let idx = visual + b.scroll as usize;
             if idx < b.entries.len() {
                 b.selected = idx;
-                let p = b.entries[idx].path.clone();
-                app.navigate_to(EntryKind::File(p), 0)?;
+                Some(b.entries[idx].clone())
+            } else {
+                None
             }
         }
+    };
+    if let Some(entry) = entry_to_open {
+        activate_browser_entry(app, entry)?;
     }
     Ok(())
 }

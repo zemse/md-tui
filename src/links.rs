@@ -69,13 +69,44 @@ pub fn resolve(dest: &str, base_dir: Option<&Path>) -> LinkTarget {
         Some((p, a)) => (p, Some(a.to_string())),
         None => (dest, None),
     };
+    let decoded = percent_decode(path_part);
     let path: PathBuf = match base_dir {
-        Some(b) => b.join(path_part),
-        None => PathBuf::from(path_part),
+        Some(b) => b.join(&decoded),
+        None => PathBuf::from(decoded),
     };
     match anchor {
         Some(a) => LinkTarget::FileAnchor(path, slugify(&a)),
         None => LinkTarget::LocalFile(path),
+    }
+}
+
+/// Minimal URL percent-decoder for local link paths (handles `%20` and friends).
+/// UTF-8 aware: bytes are decoded then re-validated; falls back to the original
+/// string if the result isn't valid UTF-8.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 

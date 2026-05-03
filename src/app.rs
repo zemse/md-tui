@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ratatui::layout::Rect;
 
 use crate::links::LinkTarget;
@@ -23,10 +23,14 @@ pub struct Options {
 
 pub struct App {
     pub view: View,
+    /// Search root — set at launch from the file/dir argument; never moves.
+    pub root: PathBuf,
     pub history: Vec<HistoryEntry>,
     pub forward: Vec<HistoryEntry>,
     pub opts: Options,
     pub help_open: bool,
+    /// `Some` while the fuzzy search overlay is active.
+    pub search: Option<Search>,
     pub should_quit: bool,
     pub status: String,
     pub viewport: Rect,
@@ -65,7 +69,7 @@ pub enum ReaderOrigin {
 }
 
 pub struct Browser {
-    pub root: PathBuf,
+    pub dir: PathBuf,
     pub entries: Vec<BrowserEntry>,
     pub selected: usize,
     pub scroll: u16,
@@ -75,10 +79,45 @@ pub struct Browser {
 pub struct BrowserEntry {
     pub path: PathBuf,
     pub display: String,
+    pub kind: BrowserEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserEntryKind {
+    ParentDir,
+    Dir,
+    Markdown,
+    Other,
+}
+
+pub struct Search {
+    pub query: String,
+    pub results: Vec<SearchResult>,
+    pub selected: usize,
+    /// Pre-built index of paths under the search root. Filtered by `query`
+    /// each time the query changes.
+    paths: Vec<IndexedPath>,
+}
+
+#[derive(Clone)]
+struct IndexedPath {
+    path: PathBuf,
+    display: String,
+    display_lower: String,
+    is_dir: bool,
+}
+
+#[derive(Clone)]
+pub struct SearchResult {
+    pub path: PathBuf,
+    pub display: String,
+    pub score: i32,
+    pub is_dir: bool,
 }
 
 impl App {
     pub fn new(source: Source, opts: Options) -> Result<Self> {
+        let root = derive_root(&source);
         let view = match source {
             Source::File(p) => View::Reader(Reader::from_file(&p)?),
             Source::Directory(d) => View::Browser(Browser::scan(&d)?),
@@ -86,25 +125,16 @@ impl App {
         };
         Ok(Self {
             view,
+            root,
             history: Vec::new(),
             forward: Vec::new(),
             opts,
             help_open: false,
+            search: None,
             should_quit: false,
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn current_path(&self) -> Option<&Path> {
-        match &self.view {
-            View::Reader(r) => match &r.origin {
-                ReaderOrigin::File(p) => Some(p.as_path()),
-                ReaderOrigin::Stdin => None,
-            },
-            View::Browser(b) => Some(b.root.as_path()),
-        }
     }
 
     pub fn record_current(&self) -> HistoryEntry {
@@ -117,7 +147,7 @@ impl App {
                 scroll: r.scroll,
             },
             View::Browser(b) => HistoryEntry {
-                kind: EntryKind::Directory(b.root.clone()),
+                kind: EntryKind::Directory(b.dir.clone()),
                 scroll: b.scroll,
             },
         }
@@ -169,6 +199,14 @@ impl App {
         Ok(())
     }
 
+    pub fn open_search(&mut self) {
+        self.search = Some(Search::build(&self.root));
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+    }
+
     /// Resolve and follow a link target. Returns `Ok(true)` if the action was
     /// handled internally (navigation), `Ok(false)` if it was external.
     pub fn follow(&mut self, target: LinkTarget) -> Result<bool> {
@@ -183,25 +221,39 @@ impl App {
                 Ok(true)
             }
             LinkTarget::LocalFile(p) => {
-                let path = canonicalize_or(p);
-                if !path.exists() {
-                    self.status = format!("Not found: {}", path.display());
-                    return Ok(false);
-                }
-                if path.is_dir() {
-                    self.navigate_to(EntryKind::Directory(path), 0)?;
+                let resolved = match resolve_local_path(&p) {
+                    Some(r) => r,
+                    None => {
+                        self.status = format!("Not found: {}", p.display());
+                        return Ok(false);
+                    }
+                };
+                if resolved.is_dir() {
+                    self.navigate_to(EntryKind::Directory(resolved), 0)?;
+                    Ok(true)
+                } else if is_markdown_file(&resolved) {
+                    self.navigate_to(EntryKind::File(resolved), 0)?;
+                    Ok(true)
                 } else {
-                    self.navigate_to(EntryKind::File(path), 0)?;
+                    let _ = open::that_detached(&resolved);
+                    self.status = format!("Opened externally: {}", resolved.display());
+                    Ok(false)
                 }
-                Ok(true)
             }
             LinkTarget::FileAnchor(p, slug) => {
-                let path = canonicalize_or(p);
-                if !path.exists() {
-                    self.status = format!("Not found: {}", path.display());
+                let resolved = match resolve_local_path(&p) {
+                    Some(r) => r,
+                    None => {
+                        self.status = format!("Not found: {}", p.display());
+                        return Ok(false);
+                    }
+                };
+                if !is_markdown_file(&resolved) {
+                    let _ = open::that_detached(&resolved);
+                    self.status = format!("Opened externally: {}", resolved.display());
                     return Ok(false);
                 }
-                self.navigate_to(EntryKind::File(path), 0)?;
+                self.navigate_to(EntryKind::File(resolved), 0)?;
                 self.scroll_to_anchor(&slug);
                 Ok(true)
             }
@@ -246,6 +298,40 @@ impl App {
     }
 }
 
+fn derive_root(source: &Source) -> PathBuf {
+    let base = match source {
+        Source::File(p) => p
+            .parent()
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        Source::Directory(d) => d.clone(),
+        Source::Stdin(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    std::fs::canonicalize(&base).unwrap_or(base)
+}
+
+pub fn is_markdown_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd"))
+        .unwrap_or(false)
+}
+
+/// Resolve a local link's path: try as-is, then with a `.md` extension as a
+/// fallback. Returns `None` if neither variant exists.
+fn resolve_local_path(p: &Path) -> Option<PathBuf> {
+    if p.exists() {
+        return Some(canonicalize_or(p.to_path_buf()));
+    }
+    if p.extension().is_none() {
+        let with_md = p.with_extension("md");
+        if with_md.exists() {
+            return Some(canonicalize_or(with_md));
+        }
+    }
+    None
+}
+
 fn canonicalize_or(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
@@ -277,46 +363,182 @@ impl Reader {
 }
 
 impl Browser {
-    pub fn scan(root: &Path) -> Result<Self> {
+    /// One-level directory listing: a `..` entry (if there is a parent),
+    /// then sub-directories, then files; each group sorted case-insensitively.
+    pub fn scan(dir: &Path) -> Result<Self> {
         let mut entries = Vec::new();
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .max_depth(8)
-            .into_iter()
-            .filter_entry(|e| !is_hidden(e))
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() { continue; }
-            let p = entry.path();
-            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if !matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd") {
-                continue;
+        if let Some(parent) = dir.parent() {
+            if parent != dir {
+                entries.push(BrowserEntry {
+                    path: parent.to_path_buf(),
+                    display: "../".to_string(),
+                    kind: BrowserEntryKind::ParentDir,
+                });
             }
-            let display = p
-                .strip_prefix(root)
-                .unwrap_or(p)
-                .display()
-                .to_string();
-            entries.push(BrowserEntry { path: p.to_path_buf(), display });
         }
-        entries.sort_by(|a, b| a.display.cmp(&b.display));
+        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let read = std::fs::read_dir(dir)
+            .map_err(|e| anyhow!("read_dir {}: {}", dir.display(), e))?;
+        for entry in read.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if name.starts_with('.') { continue; }
+            let path = entry.path();
+            let ft = match entry.file_type() { Ok(f) => f, Err(_) => continue };
+            if ft.is_dir() {
+                dirs.push((name, path));
+            } else if ft.is_file() {
+                files.push((name, path));
+            }
+        }
+        let by_name = |a: &(String, PathBuf), b: &(String, PathBuf)| {
+            a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+        };
+        dirs.sort_by(by_name);
+        files.sort_by(by_name);
+        for (name, path) in dirs {
+            entries.push(BrowserEntry {
+                path,
+                display: format!("{}/", name),
+                kind: BrowserEntryKind::Dir,
+            });
+        }
+        for (name, path) in files {
+            let kind = if is_markdown_file(&path) {
+                BrowserEntryKind::Markdown
+            } else {
+                BrowserEntryKind::Other
+            };
+            entries.push(BrowserEntry { path, display: name, kind });
+        }
         Ok(Self {
-            root: root.to_path_buf(),
+            dir: dir.to_path_buf(),
             entries,
             selected: 0,
             scroll: 0,
         })
     }
 
-    pub fn selected_path(&self) -> Option<&Path> {
-        self.entries.get(self.selected).map(|e| e.path.as_path())
+    #[allow(dead_code)]
+    pub fn selected_entry(&self) -> Option<&BrowserEntry> {
+        self.entries.get(self.selected)
     }
 }
 
-fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+impl Search {
+    /// Build the index by walking `root` (depth-capped, hidden dirs skipped).
+    pub fn build(root: &Path) -> Self {
+        let mut paths = Vec::new();
+        for entry in walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(8)
+            .into_iter()
+            .filter_entry(|e| !is_hidden_walk(e))
+            .filter_map(|e| e.ok())
+        {
+            if entry.path() == root { continue; }
+            let display = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .display()
+                .to_string();
+            let display_lower = display.to_ascii_lowercase();
+            let is_dir = entry.file_type().is_dir();
+            paths.push(IndexedPath {
+                path: entry.path().to_path_buf(),
+                display,
+                display_lower,
+                is_dir,
+            });
+        }
+        let mut s = Self {
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+            paths,
+        };
+        s.refresh();
+        s
+    }
+
+    pub fn refresh(&mut self) {
+        self.results.clear();
+        let q = self.query.to_ascii_lowercase();
+        if q.is_empty() {
+            for ip in &self.paths {
+                self.results.push(SearchResult {
+                    path: ip.path.clone(),
+                    display: ip.display.clone(),
+                    score: 0,
+                    is_dir: ip.is_dir,
+                });
+            }
+            self.results.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then(a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()))
+            });
+        } else {
+            for ip in &self.paths {
+                if let Some(score) = score_substring(&ip.display_lower, &q) {
+                    self.results.push(SearchResult {
+                        path: ip.path.clone(),
+                        display: ip.display.clone(),
+                        score,
+                        is_dir: ip.is_dir,
+                    });
+                }
+            }
+            self.results.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then(a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()))
+            });
+        }
+        if self.selected >= self.results.len() {
+            self.selected = 0;
+        }
+    }
+
+    pub fn move_selection(&mut self, delta: i32) {
+        let n = self.results.len() as i32;
+        if n == 0 { return; }
+        let new = ((self.selected as i32 + delta) % n + n) % n;
+        self.selected = new as usize;
+    }
+}
+
+fn is_hidden_walk(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
         .map(|s| s.starts_with('.') && s != "." && s != "..")
         .unwrap_or(false)
+}
+
+/// Substring score: higher when the match starts earlier, at a word boundary,
+/// or in the basename. Returns `None` if `pattern` is not a substring.
+fn score_substring(text: &str, pattern: &str) -> Option<i32> {
+    let idx = text.find(pattern)?;
+    let mut score = 1000 - idx as i32;
+    if idx == 0 {
+        score += 500;
+    } else if let Some(prev) = text.as_bytes().get(idx - 1) {
+        if matches!(*prev as char, '/' | '_' | '-' | '.' | ' ') {
+            score += 250;
+        }
+    }
+    if let Some(slash) = text.rfind('/') {
+        if idx > slash {
+            score += 100;
+        }
+    } else {
+        score += 100;
+    }
+    score -= text.len() as i32 / 4;
+    Some(score)
 }

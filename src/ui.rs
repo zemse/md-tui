@@ -4,17 +4,17 @@ use anyhow::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
-use crate::app::{App, View};
+use crate::app::{self, App, BrowserEntryKind, View};
 use crate::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -67,6 +67,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_status(f, app, status);
 
+    if app.search.is_some() {
+        draw_search(f, app, area);
+    }
+
     if app.help_open {
         draw_help(f, area);
     }
@@ -82,8 +86,7 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
     let visible_h = area.height as usize;
 
     let line_num_w = if app.opts.line_numbers {
-        let w = format!("{}", total).len() as u16 + 1;
-        w
+        format!("{}", total).len() as u16 + 1
     } else { 0 };
     let line_num_area = Rect { x: area.x, y: area.y, width: line_num_w, height: area.height };
     let body_area = Rect { x: area.x + line_num_w, y: area.y, width: area.width.saturating_sub(line_num_w), height: area.height };
@@ -94,7 +97,6 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
         let idx = scroll + i;
         if idx >= total { break; }
         let mut line = rendered.lines[idx].clone();
-        // Highlight focused link.
         if let Some(fi) = r.focused_link {
             if let Some(link) = rendered.link_map.links.get(fi) {
                 if link.line == idx {
@@ -122,8 +124,6 @@ fn highlight_focused(
     link: &crate::links::LinkSpan,
     theme: &crate::theme::Theme,
 ) {
-    // Re-style spans whose horizontal position falls inside [col_start, col_end).
-    // This is a best-effort post-pass; it relies on spans being rendered left-to-right.
     let mut col = 0usize;
     for span in &mut line.spans {
         let w = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
@@ -142,7 +142,7 @@ fn highlight_focused(
 fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let View::Browser(b) = &app.view else { return; };
     let theme = &app.opts.theme;
-    let title = format!(" {} ", b.root.display());
+    let title = format!(" {} ", b.dir.display());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -153,7 +153,7 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = b
         .entries
         .iter()
-        .map(|e| ListItem::new(e.display.clone()))
+        .map(|e| ListItem::new(Span::styled(e.display.clone(), browser_entry_style(e.kind, theme))))
         .collect();
     let list = List::new(items)
         .highlight_style(
@@ -163,9 +163,103 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
-    let mut state = ListState::default();
-    state.select(Some(b.selected));
+    let mut state = ListState::default()
+        .with_offset(b.scroll as usize)
+        .with_selected(Some(b.selected));
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn browser_entry_style(kind: BrowserEntryKind, theme: &crate::theme::Theme) -> Style {
+    match kind {
+        BrowserEntryKind::ParentDir => Style::default().fg(theme.muted),
+        BrowserEntryKind::Dir => Style::default()
+            .fg(theme.heading[0])
+            .add_modifier(Modifier::BOLD),
+        BrowserEntryKind::Markdown => Style::default(),
+        BrowserEntryKind::Other => Style::default().fg(theme.muted),
+    }
+}
+
+fn draw_search(f: &mut Frame, app: &App, area: Rect) {
+    let Some(s) = &app.search else { return; };
+    let theme = &app.opts.theme;
+
+    let w = area.width.saturating_sub(8).max(20).min(100);
+    let h = area.height.saturating_sub(4).max(8);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, popup);
+
+    let title = format!(" Search [{}] ", s.results.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(theme.heading[0]));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    let prompt = Line::from(vec![
+        Span::styled(
+            "▸ ",
+            Style::default().fg(theme.heading[0]).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(s.query.clone()),
+        Span::styled("█", Style::default().fg(theme.heading[0])),
+        Span::styled(
+            format!("   {}", short_root(&app.root)),
+            Style::default().fg(theme.muted),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(prompt), layout[0]);
+
+    let items: Vec<ListItem> = s
+        .results
+        .iter()
+        .map(|r| {
+            let style = if r.is_dir {
+                Style::default()
+                    .fg(theme.heading[0])
+                    .add_modifier(Modifier::BOLD)
+            } else if app::is_markdown_file(&r.path) {
+                Style::default()
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            let display = if r.is_dir {
+                format!("{}/", r.display)
+            } else {
+                r.display.clone()
+            };
+            ListItem::new(Span::styled(display, style))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(theme.status_bg)
+                .fg(theme.status_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default().with_selected(Some(s.selected));
+    f.render_stateful_widget(list, layout[1], &mut state);
+}
+
+fn short_root(p: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = p.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    p.display().to_string()
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -175,14 +269,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             crate::app::ReaderOrigin::File(p) => p.display().to_string(),
             crate::app::ReaderOrigin::Stdin => "<stdin>".to_string(),
         },
-        View::Browser(b) => b.root.display().to_string(),
+        View::Browser(b) => b.dir.display().to_string(),
     };
 
     let pos = match &app.view {
         View::Reader(r) => {
             let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
-            let h = area.height.max(1) as usize;
-            let _ = h;
             if total == 0 {
                 "0%".to_string()
             } else {
@@ -207,15 +299,18 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     let left = Span::styled(
         format!(" {} ", path),
-        Style::default().bg(theme.status_bg).fg(theme.status_fg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme.status_bg)
+            .fg(theme.status_fg)
+            .add_modifier(Modifier::BOLD),
     );
-    let mid = Span::styled(
-        format!(" {} ", middle),
-        Style::default().fg(theme.muted),
-    );
+    let mid = Span::styled(format!(" {} ", middle), Style::default().fg(theme.muted));
     let right = Span::styled(
         format!(" {} ", pos),
-        Style::default().bg(theme.status_bg).fg(theme.status_fg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme.status_bg)
+            .fg(theme.status_fg)
+            .add_modifier(Modifier::BOLD),
     );
 
     let used = unicode_width::UnicodeWidthStr::width(left.content.as_ref())
@@ -236,33 +331,36 @@ fn describe_target(t: &LinkTarget) -> String {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let w = 56.min(area.width.saturating_sub(4));
-    let h = 22.min(area.height.saturating_sub(4));
+    let w = 60.min(area.width.saturating_sub(4));
+    let h = 24.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect { x, y, width: w, height: h };
     f.render_widget(Clear, popup);
     let body = vec![
-        Line::from("md-tui keybindings"),
+        Line::from("md keybindings"),
         Line::from(""),
-        Line::from("  j / ↓        scroll down"),
-        Line::from("  k / ↑        scroll up"),
+        Line::from("  j / ↓        scroll down / next entry"),
+        Line::from("  k / ↑        scroll up / prev entry"),
         Line::from("  d / PgDn     half/page down"),
         Line::from("  u / PgUp     half/page up"),
         Line::from("  g / G        top / bottom"),
         Line::from("  Tab / S-Tab  next / prev link"),
-        Line::from("  Enter        follow focused link"),
-        Line::from("  h / b        back"),
-        Line::from("  l / f        forward"),
-        Line::from("  o            open in browser (focused)"),
+        Line::from("  Enter        open dir / file / link"),
+        Line::from("  /            fuzzy search files & folders"),
+        Line::from("  h / b        back   (history)"),
+        Line::from("  l / f        forward (history)"),
+        Line::from("  o            open in browser (focused link)"),
         Line::from("  q / Esc      quit"),
         Line::from("  ?            toggle this help"),
         Line::from(""),
+        Line::from("  In search:   type to filter, ↑/↓ navigate,"),
+        Line::from("               Enter open, Esc cancel,"),
+        Line::from("               Ctrl-U clear query."),
+        Line::from(""),
         Line::from("  Mouse: wheel scrolls; click follows links."),
     ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Help ");
+    let block = Block::default().borders(Borders::ALL).title(" Help ");
     let para = Paragraph::new(body).block(block);
     f.render_widget(para, popup);
 }
