@@ -118,6 +118,13 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
+        if let Some(ci) = r.hover_checkbox {
+            if let Some(cb) = rendered.checkbox_map.items.get(ci) {
+                if cb.line == idx {
+                    highlight_checkbox_hover(&mut line, cb.col_start, cb.col_end);
+                }
+            }
+        }
         display_lines.push(line);
         if app.opts.line_numbers {
             nums.push(Line::from(Span::styled(
@@ -191,6 +198,21 @@ fn highlight_focused(
                 .style
                 .fg(theme.link_focused)
                 .add_modifier(Modifier::REVERSED);
+        }
+        col = span_end;
+    }
+}
+
+/// Paint reverse-video over spans that fall within `[col_start, col_end)` to
+/// signal a hovered checkbox marker.
+fn highlight_checkbox_hover(line: &mut Line<'_>, col_start: usize, col_end: usize) {
+    let mut col = 0usize;
+    for span in &mut line.spans {
+        let w = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
+        let span_start = col;
+        let span_end = col + w;
+        if span_start >= col_start && span_end <= col_end {
+            span.style = span.style.add_modifier(Modifier::REVERSED);
         }
         col = span_end;
     }

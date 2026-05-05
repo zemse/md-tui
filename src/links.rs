@@ -28,6 +28,30 @@ pub struct LinkMap {
     pub anchors: HashMap<String, usize>,
 }
 
+/// A `[ ]` / `[x]` task-list marker, located in both rendered output (line/col)
+/// and the original source (byte offset of the opening `[`).
+#[derive(Clone, Debug)]
+pub struct CheckboxSpan {
+    pub line: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    pub source_offset: usize,
+    pub checked: bool,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct CheckboxMap {
+    pub items: Vec<CheckboxSpan>,
+}
+
+impl CheckboxMap {
+    pub fn at(&self, line: usize, col: usize) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|c| c.line == line && col >= c.col_start && col < c.col_end)
+    }
+}
+
 #[allow(dead_code)]
 impl LinkMap {
     /// Returns the index of the link containing (line, col), if any.

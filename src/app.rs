@@ -66,6 +66,7 @@ pub struct Reader {
     pub scroll: u16,
     pub focused_link: Option<usize>,
     pub hover_link: Option<usize>,
+    pub hover_checkbox: Option<usize>,
 }
 
 pub enum ReaderOrigin {
@@ -285,6 +286,36 @@ impl App {
         }
     }
 
+    /// Flip the `[ ]`/`[x]` task marker at `idx` and persist to the source file.
+    /// No-op for stdin sources. Drops the cached render so the next draw
+    /// reflects the new state.
+    pub fn toggle_checkbox(&mut self, idx: usize) -> Result<()> {
+        let View::Reader(r) = &mut self.view else { return Ok(()); };
+        let Some(rendered) = r.rendered.as_ref() else { return Ok(()); };
+        let Some(cb) = rendered.checkbox_map.items.get(idx) else { return Ok(()); };
+        let offset = cb.source_offset;
+        let was_checked = cb.checked;
+        if offset + 3 > r.raw.len() { return Ok(()); }
+        let replacement = if was_checked { "[ ]" } else { "[x]" };
+        let mut new_raw = String::with_capacity(r.raw.len());
+        new_raw.push_str(&r.raw[..offset]);
+        new_raw.push_str(replacement);
+        new_raw.push_str(&r.raw[offset + 3..]);
+        r.raw = new_raw;
+        if let ReaderOrigin::File(p) = &r.origin {
+            let path = p.clone();
+            std::fs::write(&path, &r.raw)
+                .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+            self.status = if was_checked { "Unchecked".into() } else { "Checked".into() };
+        } else {
+            self.status = "Toggled (in-memory; stdin not persisted)".into();
+        }
+        r.rendered = None;
+        r.hover_checkbox = None;
+        r.hover_link = None;
+        Ok(())
+    }
+
     /// Re-render reader if width changed since last render.
     pub fn ensure_rendered(&mut self, width: u16) {
         let theme = self.opts.theme.clone();
@@ -359,6 +390,7 @@ impl Reader {
             scroll: 0,
             focused_link: None,
             hover_link: None,
+            hover_checkbox: None,
         })
     }
 
@@ -370,6 +402,7 @@ impl Reader {
             scroll: 0,
             focused_link: None,
             hover_link: None,
+            hover_checkbox: None,
         }
     }
 }

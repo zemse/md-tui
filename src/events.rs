@@ -347,11 +347,16 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
             (format!("{}", rendered.lines.len()).len() + 1) as u16
         } else { 0 };
         let inner_x = area.x + line_num_w;
-        if col < inner_x { r.hover_link = None; return; }
+        if col < inner_x {
+            r.hover_link = None;
+            r.hover_checkbox = None;
+            return;
+        }
         let local_col = (col - inner_x) as usize;
         let local_row = (row - area.y) as usize;
         let line_idx = r.scroll as usize + local_row;
         r.hover_link = rendered.link_map.at(line_idx, local_col);
+        r.hover_checkbox = rendered.checkbox_map.at(line_idx, local_col);
     }
 }
 
@@ -368,6 +373,11 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
             let local_col = (col - inner_x) as usize;
             let local_row = (row - area.y) as usize;
             let line_idx = r.scroll as usize + local_row;
+            // Checkbox takes priority over link (the marker isn't part of any link).
+            if let Some(ci) = rendered.checkbox_map.at(line_idx, local_col) {
+                app.toggle_checkbox(ci)?;
+                return Ok(());
+            }
             if let Some(li) = rendered.link_map.at(line_idx, local_col) {
                 let target = rendered.link_map.links[li].target.clone();
                 r.focused_link = Some(li);
