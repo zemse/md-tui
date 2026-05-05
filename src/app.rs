@@ -34,6 +34,9 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub viewport: Rect,
+    /// Mouse capture state. When `false`, drag/click events fall through to
+    /// the terminal so the user can select text natively.
+    pub mouse_enabled: bool,
 }
 
 pub enum View {
@@ -45,6 +48,8 @@ pub enum View {
 pub struct HistoryEntry {
     pub kind: EntryKind,
     pub scroll: u16,
+    /// Browser cursor position. `None` for reader entries.
+    pub selected: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -134,6 +139,7 @@ impl App {
             should_quit: false,
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
+            mouse_enabled: true,
         })
     }
 
@@ -145,10 +151,12 @@ impl App {
                     ReaderOrigin::Stdin => EntryKind::Stdin(r.raw.clone()),
                 },
                 scroll: r.scroll,
+                selected: None,
             },
             View::Browser(b) => HistoryEntry {
                 kind: EntryKind::Directory(b.dir.clone()),
                 scroll: b.scroll,
+                selected: Some(b.selected),
             },
         }
     }
@@ -157,14 +165,14 @@ impl App {
         self.forward.clear();
         let prev = self.record_current();
         self.history.push(prev);
-        self.load(kind, scroll)
+        self.load(kind, scroll, None)
     }
 
     pub fn go_back(&mut self) -> Result<()> {
         if let Some(prev) = self.history.pop() {
             let cur = self.record_current();
             self.forward.push(cur);
-            self.load(prev.kind, prev.scroll)?;
+            self.load(prev.kind, prev.scroll, prev.selected)?;
         }
         Ok(())
     }
@@ -173,12 +181,12 @@ impl App {
         if let Some(next) = self.forward.pop() {
             let cur = self.record_current();
             self.history.push(cur);
-            self.load(next.kind, next.scroll)?;
+            self.load(next.kind, next.scroll, next.selected)?;
         }
         Ok(())
     }
 
-    fn load(&mut self, kind: EntryKind, scroll: u16) -> Result<()> {
+    fn load(&mut self, kind: EntryKind, scroll: u16, selected: Option<usize>) -> Result<()> {
         self.view = match kind {
             EntryKind::File(p) => {
                 let mut r = Reader::from_file(&p)?;
@@ -188,6 +196,10 @@ impl App {
             EntryKind::Directory(d) => {
                 let mut b = Browser::scan(&d)?;
                 b.scroll = scroll;
+                if let Some(sel) = selected {
+                    let max = b.entries.len().saturating_sub(1);
+                    b.selected = sel.min(max);
+                }
                 View::Browser(b)
             }
             EntryKind::Stdin(text) => {

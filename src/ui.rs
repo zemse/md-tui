@@ -391,7 +391,7 @@ fn describe_target(t: &LinkTarget) -> String {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let w = 60.min(area.width.saturating_sub(4));
-    let h = 24.min(area.height.saturating_sub(4));
+    let h = 26.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect { x, y, width: w, height: h };
@@ -410,6 +410,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  h / b        back   (history)"),
         Line::from("  l / f        forward (history)"),
         Line::from("  o            open in browser (focused link)"),
+        Line::from("  m            toggle mouse (drag-to-select)"),
         Line::from("  q / Esc      quit"),
         Line::from("  ?            toggle this help"),
         Line::from(""),

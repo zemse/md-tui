@@ -1,10 +1,12 @@
+use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::execute;
 
 use crate::app::{self, App, BrowserEntry, BrowserEntryKind, EntryKind, SearchResult, View};
 use crate::ui;
@@ -53,6 +55,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('?') => app.help_open = !app.help_open,
         KeyCode::Char('/') => app.open_search(),
+        KeyCode::Char('m') => toggle_mouse(app),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
@@ -80,6 +83,22 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Toggle mouse capture so the user can drag-select text natively. When
+/// capture is on we get scroll/click/hover; when off the terminal handles
+/// dragging.
+fn toggle_mouse(app: &mut App) {
+    let mut out = stdout();
+    if app.mouse_enabled {
+        let _ = execute!(out, DisableMouseCapture);
+        app.mouse_enabled = false;
+        app.status = "Mouse off — drag to select text (m to re-enable)".into();
+    } else {
+        let _ = execute!(out, EnableMouseCapture);
+        app.mouse_enabled = true;
+        app.status = "Mouse on".into();
+    }
 }
 
 fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
