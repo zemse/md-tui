@@ -733,6 +733,39 @@ mod tests {
     }
 
     #[test]
+    fn go_back_walks_up_nested_browser_history() {
+        let dir = fresh_temp("nested-browser-back");
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        let a = dir.join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        app.navigate_to(EntryKind::Directory(a.clone()), 0).unwrap();
+        app.navigate_to(EntryKind::Directory(b.clone()), 0).unwrap();
+        app.navigate_to(EntryKind::Directory(c.clone()), 0).unwrap();
+
+        // Pop once: should land in `b`, not quit / collapse history.
+        app.go_back().unwrap();
+        match &app.view {
+            View::Browser(br) => assert_eq!(br.dir, b),
+            _ => panic!("expected browser at b"),
+        }
+
+        // Pop again: `a`.
+        app.go_back().unwrap();
+        match &app.view {
+            View::Browser(br) => assert_eq!(br.dir, a),
+            _ => panic!("expected browser at a"),
+        }
+
+        // History still has the original root, so we're not "stuck".
+        assert!(!app.history.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn is_markdown_file_recognises_extensions() {
         assert!(is_markdown_file(Path::new("foo.md")));
         assert!(is_markdown_file(Path::new("foo.MD")));

@@ -43,12 +43,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
-            if let View::Reader(_) = app.view {
-                if !app.history.is_empty() {
-                    app.go_back()?;
-                } else {
-                    app.should_quit = true;
-                }
+            // Esc backs out of nested navigation regardless of view; only
+            // quits when there's nowhere left to go.
+            if !app.history.is_empty() {
+                app.go_back()?;
             } else {
                 app.should_quit = true;
             }
