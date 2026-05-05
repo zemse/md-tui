@@ -25,6 +25,7 @@ anyhow = "1"
 open = "5"
 unicode-width = "0.2"
 walkdir = "2"
+ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 dirs = "6"

@@ -40,11 +40,22 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if app.search.is_some() {
         return handle_search_key(app, key);
     }
+    if let View::Reader(r) = &app.view {
+        if r.doc_search.as_ref().map(|s| s.editing).unwrap_or(false) {
+            return handle_doc_search_key(app, key);
+        }
+    }
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
-            // Esc backs out of nested navigation regardless of view; only
-            // quits when there's nowhere left to go.
+            // First, dismiss any committed in-doc search overlay.
+            if let View::Reader(r) = &app.view {
+                if r.doc_search.is_some() {
+                    app.close_doc_search();
+                    return Ok(());
+                }
+            }
+            // Otherwise back out of nested navigation; quit only at the root.
             if !app.history.is_empty() {
                 app.go_back()?;
             } else {
@@ -52,8 +63,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char('?') => app.help_open = !app.help_open,
-        KeyCode::Char('/') => app.open_search(),
+        KeyCode::Char('/') => match &app.view {
+            View::Reader(_) => app.open_doc_search(),
+            View::Browser(_) => app.open_search(),
+        },
+        KeyCode::Char('T') => app.open_search(),
+        KeyCode::Char('n') => app.doc_search_step(true),
+        KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
+        KeyCode::Char('e') => edit_current_file(app)?,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
@@ -83,6 +101,58 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// Suspend the TUI, hand the terminal to `$EDITOR` (or `vi`) on the current
+/// reader file, then restore raw mode and reload the file. No-op for stdin.
+fn edit_current_file(app: &mut App) -> Result<()> {
+    use crossterm::execute;
+    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+
+    let path = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::app::ReaderOrigin::File(p) => p.clone(),
+            crate::app::ReaderOrigin::Stdin => {
+                app.status = "Cannot edit: source is stdin".into();
+                return Ok(());
+            }
+        },
+        _ => return Ok(()),
+    };
+
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    // Restore the terminal so the editor has full control.
+    disable_raw_mode().ok();
+    let mut out = stdout();
+    execute!(out, LeaveAlternateScreen, DisableMouseCapture).ok();
+
+    let status = std::process::Command::new(&editor).arg(&path).status();
+
+    // Restore TUI state in all cases.
+    enable_raw_mode().ok();
+    execute!(out, EnterAlternateScreen).ok();
+    if app.mouse_enabled {
+        execute!(out, EnableMouseCapture).ok();
+    }
+
+    match status {
+        Ok(s) if s.success() => {
+            // Reload the file from disk so any edits are reflected.
+            if let View::Reader(r) = &mut app.view {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    r.raw = raw;
+                    r.rendered = None;
+                    app.status = format!("Reloaded {}", editor);
+                }
+            }
+        }
+        Ok(_) => app.status = format!("{} exited non-zero", editor),
+        Err(e) => app.status = format!("{}: {}", editor, e),
+    }
+    Ok(())
+}
+
 /// Toggle mouse capture so the user can drag-select text natively. When
 /// capture is on we get scroll/click/hover; when off the terminal handles
 /// dragging.
@@ -97,6 +167,34 @@ fn toggle_mouse(app: &mut App) {
         app.mouse_enabled = true;
         app.status = "Mouse on".into();
     }
+}
+
+/// Handle keystrokes while the in-document search prompt is open.
+fn handle_doc_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.close_doc_search(),
+        KeyCode::Enter => app.doc_search_commit(),
+        KeyCode::Backspace => {
+            if let View::Reader(r) = &mut app.view {
+                if let Some(s) = &mut r.doc_search { s.query.pop(); }
+            }
+            app.doc_search_refresh();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let View::Reader(r) = &mut app.view {
+                if let Some(s) = &mut r.doc_search { s.query.clear(); }
+            }
+            app.doc_search_refresh();
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let View::Reader(r) = &mut app.view {
+                if let Some(s) = &mut r.doc_search { s.query.push(c); }
+            }
+            app.doc_search_refresh();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -160,6 +258,17 @@ fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+    // Header: clickable back button.
+    if m.row == app.header_area.y && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some((sx, ex)) = app.back_button_hit {
+            if m.column >= sx && m.column < ex {
+                if !app.history.is_empty() {
+                    app.go_back()?;
+                }
+                return Ok(());
+            }
+        }
+    }
     // While the search overlay is up, the mouse wheel scrolls results.
     if app.search.is_some() {
         match m.kind {

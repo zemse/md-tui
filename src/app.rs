@@ -34,6 +34,10 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub viewport: Rect,
+    pub header_area: Rect,
+    /// Last column range occupied by the `[< Back]` button in the header,
+    /// recorded by the renderer so click handling can hit-test it.
+    pub back_button_hit: Option<(u16, u16)>,
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
@@ -67,6 +71,23 @@ pub struct Reader {
     pub focused_link: Option<usize>,
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
+    pub doc_search: Option<DocSearch>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DocSearch {
+    pub query: String,
+    pub matches: Vec<DocMatch>,
+    pub current: usize,
+    /// True while the user is still typing the query (prompt is open).
+    pub editing: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DocMatch {
+    pub line: usize,
+    pub col_start: usize,
+    pub col_end: usize,
 }
 
 pub enum ReaderOrigin {
@@ -139,6 +160,8 @@ impl App {
             should_quit: false,
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
+            header_area: Rect::new(0, 0, 0, 0),
+            back_button_hit: None,
             mouse_enabled: true,
         })
     }
@@ -233,7 +256,9 @@ impl App {
                 Ok(true)
             }
             LinkTarget::LocalFile(p) => {
-                let resolved = match resolve_local_path(&p) {
+                let resolved = match resolve_local_path(&p)
+                    .or_else(|| vault_lookup(&self.root, &p))
+                {
                     Some(r) => r,
                     None => {
                         self.status = format!("Not found: {}", p.display());
@@ -253,7 +278,9 @@ impl App {
                 }
             }
             LinkTarget::FileAnchor(p, slug) => {
-                let resolved = match resolve_local_path(&p) {
+                let resolved = match resolve_local_path(&p)
+                    .or_else(|| vault_lookup(&self.root, &p))
+                {
                     Some(r) => r,
                     None => {
                         self.status = format!("Not found: {}", p.display());
@@ -313,6 +340,73 @@ impl App {
         r.hover_checkbox = None;
         r.hover_link = None;
         Ok(())
+    }
+
+    /// Open the in-document text search prompt. No-op outside Reader.
+    pub fn open_doc_search(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            r.doc_search = Some(DocSearch {
+                query: String::new(),
+                matches: Vec::new(),
+                current: 0,
+                editing: true,
+            });
+            self.status.clear();
+        }
+    }
+
+    pub fn close_doc_search(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            r.doc_search = None;
+        }
+    }
+
+    /// Recompute matches from the rendered document for the current query.
+    pub fn doc_search_refresh(&mut self) {
+        let View::Reader(r) = &mut self.view else { return; };
+        let Some(rendered) = r.rendered.as_ref() else { return; };
+        let Some(s) = r.doc_search.as_mut() else { return; };
+        s.matches = find_doc_matches(&rendered.lines, &s.query);
+        if s.matches.is_empty() { s.current = 0; }
+        else if s.current >= s.matches.len() { s.current = 0; }
+    }
+
+    /// Confirm the current query (close prompt, jump to first match).
+    pub fn doc_search_commit(&mut self) {
+        let View::Reader(r) = &mut self.view else { return; };
+        let Some(s) = r.doc_search.as_mut() else { return; };
+        s.editing = false;
+        if s.matches.is_empty() {
+            self.status = "No matches".into();
+            return;
+        }
+        s.current = 0;
+        self.center_on_doc_match();
+    }
+
+    /// Step to the next/previous match (after commit).
+    pub fn doc_search_step(&mut self, forward: bool) {
+        let View::Reader(r) = &mut self.view else { return; };
+        let Some(s) = r.doc_search.as_mut() else { return; };
+        if s.matches.is_empty() { return; }
+        let n = s.matches.len();
+        s.current = if forward {
+            (s.current + 1) % n
+        } else {
+            (s.current + n - 1) % n
+        };
+        self.center_on_doc_match();
+    }
+
+    fn center_on_doc_match(&mut self) {
+        let h = self.viewport.height as usize;
+        let View::Reader(r) = &mut self.view else { return; };
+        let Some(s) = r.doc_search.as_ref() else { return; };
+        let Some(m) = s.matches.get(s.current) else { return; };
+        let new = m.line.saturating_sub(h / 2);
+        let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
+        let max_scroll = total.saturating_sub(h);
+        r.scroll = new.min(max_scroll) as u16;
     }
 
     /// Re-render reader if width changed since last render.
@@ -378,6 +472,59 @@ fn canonicalize_or(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
+/// Case-insensitive substring search across the rendered lines, mapped to
+/// (line, col_start, col_end) in display-width coordinates so the highlight
+/// aligns with what the user sees.
+pub fn find_doc_matches(
+    lines: &[ratatui::text::Line<'static>],
+    query: &str,
+) -> Vec<DocMatch> {
+    let mut out = Vec::new();
+    if query.is_empty() { return out; }
+    let q = query.to_ascii_lowercase();
+    for (line_idx, line) in lines.iter().enumerate() {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text_lower = text.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(rel) = text_lower[from..].find(&q) {
+            let abs = from + rel;
+            let col_start = unicode_width::UnicodeWidthStr::width(&text[..abs]);
+            let end_byte = abs + q.len();
+            let col_end = unicode_width::UnicodeWidthStr::width(&text[..end_byte]);
+            out.push(DocMatch { line: line_idx, col_start, col_end });
+            from = end_byte.max(abs + 1);
+        }
+    }
+    out
+}
+
+/// Wiki-link fallback: walk `root` looking for a markdown file whose basename
+/// (with or without `.md`) matches the file component of `target`. Returns the
+/// first hit. Bounded depth and skips dotfiles to avoid pathological scans.
+fn vault_lookup(root: &Path, target: &Path) -> Option<PathBuf> {
+    let needle = target.file_name()?.to_str()?.to_string();
+    let needle_md = if needle.contains('.') { needle.clone() } else { format!("{}.md", needle) };
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(8)
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_name()
+                .to_str()
+                .map(|s| !(s.starts_with('.') && s != "." && s != ".."))
+                .unwrap_or(true)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() { continue; }
+        let name = match entry.file_name().to_str() { Some(n) => n, None => continue };
+        if name == needle || name == needle_md {
+            return Some(canonicalize_or(entry.path().to_path_buf()));
+        }
+    }
+    None
+}
+
 impl Reader {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -390,6 +537,7 @@ impl Reader {
             focused_link: None,
             hover_link: None,
             hover_checkbox: None,
+            doc_search: None,
         })
     }
 
@@ -402,6 +550,7 @@ impl Reader {
             focused_link: None,
             hover_link: None,
             hover_checkbox: None,
+            doc_search: None,
         }
     }
 }
@@ -410,7 +559,8 @@ impl Browser {
     /// One-level directory listing: a `..` entry (if there is a parent),
     /// then sub-directories, then markdown files; each group sorted
     /// case-insensitively. Non-markdown files are skipped — this is a
-    /// markdown reader, not a generic file picker.
+    /// markdown reader, not a generic file picker. Honours .gitignore /
+    /// .ignore through the `ignore` crate.
     pub fn scan(dir: &Path) -> Result<Self> {
         let mut entries = Vec::new();
         if let Some(parent) = dir.parent() {
@@ -424,16 +574,23 @@ impl Browser {
         }
         let mut dirs: Vec<(String, PathBuf)> = Vec::new();
         let mut files: Vec<(String, PathBuf)> = Vec::new();
-        let read = std::fs::read_dir(dir)
-            .map_err(|e| anyhow!("read_dir {}: {}", dir.display(), e))?;
-        for entry in read.flatten() {
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
+        let walker = ignore::WalkBuilder::new(dir)
+            .max_depth(Some(1))
+            .hidden(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .require_git(false)
+            .build();
+        for result in walker {
+            let entry = match result { Ok(e) => e, Err(_) => continue };
+            if entry.path() == dir { continue; }
+            let name = match entry.file_name().to_str() {
+                Some(n) => n.to_string(),
+                None => continue,
             };
-            if name.starts_with('.') { continue; }
-            let path = entry.path();
-            let ft = match entry.file_type() { Ok(f) => f, Err(_) => continue };
+            let path = entry.path().to_path_buf();
+            let ft = match entry.file_type() { Some(f) => f, None => continue };
             if ft.is_dir() {
                 dirs.push((name, path));
             } else if ft.is_file() && is_markdown_file(&path) {
@@ -474,16 +631,19 @@ impl Browser {
 }
 
 impl Search {
-    /// Build the index by walking `root` (depth-capped, hidden dirs skipped).
+    /// Build the index by walking `root` (depth-capped, gitignore-aware).
     pub fn build(root: &Path) -> Self {
         let mut paths = Vec::new();
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .max_depth(8)
-            .into_iter()
-            .filter_entry(|e| !is_hidden_walk(e))
-            .filter_map(|e| e.ok())
-        {
+        let walker = ignore::WalkBuilder::new(root)
+            .max_depth(Some(8))
+            .hidden(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .require_git(false)
+            .build();
+        for result in walker {
+            let entry = match result { Ok(e) => e, Err(_) => continue };
             if entry.path() == root { continue; }
             let display = entry
                 .path()
@@ -492,7 +652,7 @@ impl Search {
                 .display()
                 .to_string();
             let display_lower = display.to_ascii_lowercase();
-            let is_dir = entry.file_type().is_dir();
+            let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
             paths.push(IndexedPath {
                 path: entry.path().to_path_buf(),
                 display,
@@ -555,14 +715,6 @@ impl Search {
         let new = ((self.selected as i32 + delta) % n + n) % n;
         self.selected = new as usize;
     }
-}
-
-fn is_hidden_walk(entry: &walkdir::DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| s.starts_with('.') && s != "." && s != "..")
-        .unwrap_or(false)
 }
 
 /// Substring score: higher when the match starts earlier, at a word boundary,

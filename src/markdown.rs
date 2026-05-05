@@ -30,6 +30,7 @@ pub fn render(source: &str, base_dir: Option<&Path>, width: u16, theme: &Theme) 
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    opts.insert(Options::ENABLE_WIKILINKS);
 
     let parser = Parser::new_ext(source, opts).into_offset_iter();
     let mut b = Builder::new(theme.clone(), width as usize, base_dir.map(|p| p.to_path_buf()));
