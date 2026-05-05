@@ -58,7 +58,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let status = chunks[1];
     app.viewport = body;
 
-    app.ensure_rendered(body.width);
+    // Reserve 1 column on the right for the reader scrollbar so layout stays
+    // stable whether or not content overflows. Browser ignores this width.
+    app.ensure_rendered(body.width.saturating_sub(1));
 
     match &app.view {
         View::Reader(_) => draw_reader(f, app, body),
@@ -88,8 +90,20 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
     let line_num_w = if app.opts.line_numbers {
         format!("{}", total).len() as u16 + 1
     } else { 0 };
+    let scrollbar_w: u16 = 1;
     let line_num_area = Rect { x: area.x, y: area.y, width: line_num_w, height: area.height };
-    let body_area = Rect { x: area.x + line_num_w, y: area.y, width: area.width.saturating_sub(line_num_w), height: area.height };
+    let body_area = Rect {
+        x: area.x + line_num_w,
+        y: area.y,
+        width: area.width.saturating_sub(line_num_w).saturating_sub(scrollbar_w),
+        height: area.height,
+    };
+    let scrollbar_area = Rect {
+        x: area.x + area.width.saturating_sub(scrollbar_w),
+        y: area.y,
+        width: scrollbar_w,
+        height: area.height,
+    };
 
     let mut display_lines: Vec<Line> = Vec::with_capacity(visible_h);
     let mut nums: Vec<Line> = Vec::with_capacity(visible_h);
@@ -117,6 +131,49 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(nums), line_num_area);
     }
     f.render_widget(Paragraph::new(display_lines), body_area);
+    draw_scrollbar(f, scrollbar_area, scroll, total, visible_h, theme);
+}
+
+/// Vertical scrollbar with a thumb sized proportionally to the visible viewport
+/// (`thumb_h ≈ visible_h * track_h / total`). When content fits entirely the
+/// thumb fills the track.
+fn draw_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    total: usize,
+    visible_h: usize,
+    theme: &crate::theme::Theme,
+) {
+    let track_h = area.height as usize;
+    if track_h == 0 || area.width == 0 { return; }
+
+    let track_style = Style::default().fg(theme.muted);
+    let thumb_style = Style::default().fg(theme.heading[0]);
+
+    let (thumb_top, thumb_h) = if total <= visible_h || total == 0 {
+        (0, track_h)
+    } else {
+        let h = ((track_h * visible_h) / total).max(1).min(track_h);
+        let max_scroll = total - visible_h;
+        let span = track_h - h;
+        let top = if max_scroll == 0 { 0 } else {
+            (scroll * span + max_scroll / 2) / max_scroll
+        };
+        (top.min(span), h)
+    };
+
+    let lines: Vec<Line> = (0..track_h)
+        .map(|i| {
+            let in_thumb = i >= thumb_top && i < thumb_top + thumb_h;
+            if in_thumb {
+                Line::from(Span::styled("█", thumb_style))
+            } else {
+                Line::from(Span::styled("│", track_style))
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn highlight_focused(
@@ -275,10 +332,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let pos = match &app.view {
         View::Reader(r) => {
             let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
-            if total == 0 {
-                "0%".to_string()
+            let h = app.viewport.height as usize;
+            if total == 0 || total <= h {
+                "All".to_string()
             } else {
-                let pct = (r.scroll as usize * 100 / total.max(1)).min(100);
+                let max_scroll = total - h;
+                let pct = ((r.scroll as usize) * 100 / max_scroll).min(100);
                 format!("{}%", pct)
             }
         }
