@@ -1,5 +1,5 @@
 [package]
-name = "md-rs"
+name = "md-tui-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Terminal markdown reader with mouse support, clickable links and task lists, fuzzy search, and a directory browser."

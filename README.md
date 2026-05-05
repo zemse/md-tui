@@ -5,6 +5,12 @@ A terminal markdown reader. Built with Rust + [ratatui](https://ratatui.rs).
 ## Install
 
 ```sh
+cargo install md-tui-rs
+```
+
+Or from a local checkout:
+
+```sh
 cargo install --path .
 ```
 
