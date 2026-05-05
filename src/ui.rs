@@ -255,7 +255,6 @@ fn browser_entry_style(kind: BrowserEntryKind, theme: &crate::theme::Theme) -> S
             .fg(theme.heading[0])
             .add_modifier(Modifier::BOLD),
         BrowserEntryKind::Markdown => Style::default(),
-        BrowserEntryKind::Other => Style::default().fg(theme.muted),
     }
 }
 

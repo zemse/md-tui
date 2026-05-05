@@ -1316,4 +1316,46 @@ mod tests {
             assert_eq!(l.target, LinkTarget::Url("https://x".to_string()));
         }
     }
+
+    #[test]
+    fn renders_unchecked_task_marker() {
+        let src = "- [ ] task one\n";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.checkbox_map.items.len(), 1);
+        let cb = &r.checkbox_map.items[0];
+        assert!(!cb.checked);
+        assert_eq!(&src[cb.source_offset..cb.source_offset + 3], "[ ]");
+    }
+
+    #[test]
+    fn renders_checked_task_marker() {
+        let src = "- [x] done\n";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.checkbox_map.items.len(), 1);
+        let cb = &r.checkbox_map.items[0];
+        assert!(cb.checked);
+        assert_eq!(&src[cb.source_offset..cb.source_offset + 3], "[x]");
+    }
+
+    #[test]
+    fn checkbox_lookup_by_line_col() {
+        let src = "- [ ] task\n";
+        let r = render(src, None, 80, &Theme::dark());
+        let cb = r.checkbox_map.items[0].clone();
+        assert_eq!(r.checkbox_map.at(cb.line, cb.col_start), Some(0));
+        assert_eq!(r.checkbox_map.at(cb.line, cb.col_end - 1), Some(0));
+        assert_eq!(r.checkbox_map.at(cb.line, cb.col_end), None);
+    }
+
+    #[test]
+    fn multiple_checkboxes_indexed_in_order() {
+        let src = "- [ ] one\n- [x] two\n- [ ] three\n";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.checkbox_map.items.len(), 3);
+        let states: Vec<bool> = r.checkbox_map.items.iter().map(|c| c.checked).collect();
+        assert_eq!(states, vec![false, true, false]);
+        for cb in &r.checkbox_map.items {
+            assert_eq!(&src[cb.source_offset..cb.source_offset + 1], "[");
+        }
+    }
 }

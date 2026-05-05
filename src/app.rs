@@ -93,7 +93,6 @@ pub enum BrowserEntryKind {
     ParentDir,
     Dir,
     Markdown,
-    Other,
 }
 
 pub struct Search {
@@ -409,7 +408,9 @@ impl Reader {
 
 impl Browser {
     /// One-level directory listing: a `..` entry (if there is a parent),
-    /// then sub-directories, then files; each group sorted case-insensitively.
+    /// then sub-directories, then markdown files; each group sorted
+    /// case-insensitively. Non-markdown files are skipped — this is a
+    /// markdown reader, not a generic file picker.
     pub fn scan(dir: &Path) -> Result<Self> {
         let mut entries = Vec::new();
         if let Some(parent) = dir.parent() {
@@ -435,7 +436,7 @@ impl Browser {
             let ft = match entry.file_type() { Ok(f) => f, Err(_) => continue };
             if ft.is_dir() {
                 dirs.push((name, path));
-            } else if ft.is_file() {
+            } else if ft.is_file() && is_markdown_file(&path) {
                 files.push((name, path));
             }
         }
@@ -452,12 +453,11 @@ impl Browser {
             });
         }
         for (name, path) in files {
-            let kind = if is_markdown_file(&path) {
-                BrowserEntryKind::Markdown
-            } else {
-                BrowserEntryKind::Other
-            };
-            entries.push(BrowserEntry { path, display: name, kind });
+            entries.push(BrowserEntry {
+                path,
+                display: name,
+                kind: BrowserEntryKind::Markdown,
+            });
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -586,4 +586,159 @@ fn score_substring(text: &str, pattern: &str) -> Option<i32> {
     }
     score -= text.len() as i32 / 4;
     Some(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Theme;
+
+    /// Per-test temp dir under the system temp root. Cleared on entry so a
+    /// previous failure doesn't leave stale state behind.
+    fn fresh_temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn opts() -> Options {
+        Options { width: 80, line_numbers: false, theme: Theme::dark() }
+    }
+
+    #[test]
+    fn browser_lists_only_dirs_and_markdown() {
+        let dir = fresh_temp("browser-filter");
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        std::fs::write(dir.join("b.markdown"), "# b").unwrap();
+        std::fs::write(dir.join("note.txt"), "ignored").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "ignored").unwrap();
+        std::fs::write(dir.join(".hidden.md"), "hidden").unwrap();
+
+        let b = Browser::scan(&dir).unwrap();
+        let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
+
+        assert!(names.contains(&"subdir/"), "missing subdir, got {:?}", names);
+        assert!(names.contains(&"a.md"), "missing a.md, got {:?}", names);
+        assert!(names.contains(&"b.markdown"), "missing b.markdown, got {:?}", names);
+        assert!(!names.contains(&"note.txt"));
+        assert!(!names.contains(&"Cargo.toml"));
+        assert!(names.iter().all(|n| !n.contains(".hidden")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkbox_toggle_writes_back_to_file() {
+        let dir = fresh_temp("checkbox-toggle");
+        let path = dir.join("tasks.md");
+        std::fs::write(&path, "- [ ] alpha\n- [x] beta\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+
+        // Flip the first marker (currently unchecked → checked).
+        app.toggle_checkbox(0).unwrap();
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after_first, "- [x] alpha\n- [x] beta\n");
+
+        // Render must regenerate; toggle the second marker (checked → unchecked).
+        app.ensure_rendered(80);
+        app.toggle_checkbox(1).unwrap();
+        let after_second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after_second, "- [x] alpha\n- [ ] beta\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkbox_toggle_is_idempotent_round_trip() {
+        let dir = fresh_temp("checkbox-roundtrip");
+        let path = dir.join("t.md");
+        std::fs::write(&path, "- [ ] task\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.toggle_checkbox(0).unwrap();
+        app.ensure_rendered(80);
+        app.toggle_checkbox(0).unwrap();
+
+        let final_content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(final_content, "- [ ] task\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn go_back_restores_browser_selected_index() {
+        let dir = fresh_temp("history-selected");
+        std::fs::write(dir.join("a.md"), "# A").unwrap();
+        std::fs::write(dir.join("b.md"), "# B").unwrap();
+        std::fs::write(dir.join("c.md"), "# C").unwrap();
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+
+        // Pick a non-default entry.
+        let target_idx = match &mut app.view {
+            View::Browser(b) => {
+                let idx = b
+                    .entries
+                    .iter()
+                    .position(|e| e.display == "b.md")
+                    .expect("b.md must be listed");
+                b.selected = idx;
+                idx
+            }
+            _ => panic!("expected browser at startup"),
+        };
+
+        // Open the file, then come back.
+        let target_path = match &app.view {
+            View::Browser(b) => b.entries[b.selected].path.clone(),
+            _ => unreachable!(),
+        };
+        app.navigate_to(EntryKind::File(target_path), 0).unwrap();
+        app.go_back().unwrap();
+
+        match &app.view {
+            View::Browser(b) => assert_eq!(b.selected, target_idx),
+            _ => panic!("expected to land back in browser"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reader_scroll_preserved_across_back_forward() {
+        let dir = fresh_temp("history-scroll");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "# A\n\nbody\n").unwrap();
+        let other = dir.join("b.md");
+        std::fs::write(&other, "# B").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        if let View::Reader(r) = &mut app.view {
+            r.scroll = 1;
+        }
+        app.navigate_to(EntryKind::File(other), 0).unwrap();
+        app.go_back().unwrap();
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.scroll, 1, "scroll should be restored"),
+            _ => panic!(),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_markdown_file_recognises_extensions() {
+        assert!(is_markdown_file(Path::new("foo.md")));
+        assert!(is_markdown_file(Path::new("foo.MD")));
+        assert!(is_markdown_file(Path::new("foo.markdown")));
+        assert!(is_markdown_file(Path::new("foo.mdown")));
+        assert!(!is_markdown_file(Path::new("foo.txt")));
+        assert!(!is_markdown_file(Path::new("foo")));
+    }
 }

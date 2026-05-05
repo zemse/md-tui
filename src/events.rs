@@ -315,10 +315,6 @@ fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
         BrowserEntryKind::Markdown => {
             app.navigate_to(EntryKind::File(entry.path), 0)?;
         }
-        BrowserEntryKind::Other => {
-            let _ = open::that_detached(&entry.path);
-            app.status = format!("Opened externally: {}", entry.path.display());
-        }
     }
     Ok(())
 }
