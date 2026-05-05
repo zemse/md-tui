@@ -302,11 +302,133 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             update_hover(app, m.column, m.row);
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            click_at(app, m.column, m.row)?;
+            // Double-click → select & copy the word under the cursor.
+            let now = std::time::Instant::now();
+            let double = match app.last_click {
+                Some((t, c, r)) => {
+                    now.duration_since(t) <= std::time::Duration::from_millis(450)
+                        && c == m.column
+                        && r == m.row
+                }
+                None => false,
+            };
+            app.last_click = Some((now, m.column, m.row));
+            if double {
+                select_word_at(app, m.column, m.row);
+            } else {
+                click_at(app, m.column, m.row)?;
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Select the word under the click and push it to the system clipboard via
+/// OSC 52, which works on every modern terminal without needing a clipboard
+/// crate. Updates the status bar with the copied text.
+fn select_word_at(app: &mut App, col: u16, row: u16) {
+    let area = app.viewport;
+    if !point_in(area, col, row) { return; }
+    let View::Reader(r) = &app.view else { return; };
+    let Some(rendered) = &r.rendered else { return; };
+
+    let line_num_w = if app.opts.line_numbers {
+        (format!("{}", rendered.lines.len()).len() + 1) as u16
+    } else { 0 };
+    let inner_x = area.x + line_num_w;
+    if col < inner_x { return; }
+    let local_col = (col - inner_x) as usize;
+    let line_idx = r.scroll as usize + (row - area.y) as usize;
+    let Some(line) = rendered.lines.get(line_idx) else { return; };
+
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let Some(word) = word_at_col(&text, local_col) else { return; };
+
+    use std::io::Write;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(word.as_bytes());
+    let mut out = stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", encoded);
+    let _ = out.flush();
+    app.status = format!("Copied: {}", word);
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::word_at_col;
+
+    #[test]
+    fn picks_word_in_simple_line() {
+        let line = "the quick brown fox";
+        // 'q' lives at columns 4..5
+        assert_eq!(word_at_col(line, 4).as_deref(), Some("quick"));
+        assert_eq!(word_at_col(line, 6).as_deref(), Some("quick"));
+    }
+
+    #[test]
+    fn returns_none_on_whitespace() {
+        let line = "alpha   beta";
+        assert_eq!(word_at_col(line, 6), None);
+    }
+
+    #[test]
+    fn strips_trailing_punctuation() {
+        let line = "hello, world!";
+        assert_eq!(word_at_col(line, 0).as_deref(), Some("hello"));
+        assert_eq!(word_at_col(line, 8).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn keeps_internal_dashes_underscores_and_paths() {
+        let line = "src/foo_bar-baz.rs";
+        assert_eq!(word_at_col(line, 0).as_deref(), Some("src/foo_bar-baz.rs"));
+    }
+}
+
+/// Walk left and right from `target_col` in `line` (using display widths) to
+/// find the run of non-whitespace characters covering that column.
+fn word_at_col(line: &str, target_col: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut col = 0usize;
+    let mut hit_byte: Option<usize> = None;
+    for (i, ch) in line.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if target_col >= col && target_col < col + w.max(1) {
+            hit_byte = Some(i);
+            break;
+        }
+        col += w;
+    }
+    let hit = hit_byte?;
+    let bytes = line.as_bytes();
+    if bytes.get(hit).map(|b| (*b as char).is_whitespace()).unwrap_or(true) {
+        return None;
+    }
+    let mut start = hit;
+    while start > 0 {
+        let prev = line[..start].chars().next_back()?;
+        if prev.is_whitespace() { break; }
+        start -= prev.len_utf8();
+    }
+    let mut end = hit;
+    let mut iter = line[hit..].char_indices();
+    iter.next(); // skip the hit char itself
+    let len = line.len();
+    let mut cursor = hit;
+    for (_, ch) in line[hit..].char_indices() {
+        if ch.is_whitespace() { break; }
+        cursor += ch.len_utf8();
+        end = cursor;
+    }
+    let _ = iter;
+    let _ = len;
+    if end <= start { return None; }
+    let word = line[start..end].trim_matches(|c: char| {
+        // Strip leading/trailing punctuation but keep internal characters.
+        c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '.' | '#')
+    });
+    if word.is_empty() { None } else { Some(word.to_string()) }
 }
 
 fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {

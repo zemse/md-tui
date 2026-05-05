@@ -44,6 +44,9 @@ pub struct App {
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
+    /// Most recent left-mouse-down (Instant + column + row), used to detect
+    /// double-clicks for word selection.
+    pub last_click: Option<(std::time::Instant, u16, u16)>,
     /// Detected terminal image protocol. `None` if the terminal can't render
     /// images (then we fall back to placeholder text).
     pub image_picker: Option<Picker>,
@@ -175,6 +178,7 @@ impl App {
             header_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
             mouse_enabled: true,
+            last_click: None,
             image_picker: Picker::from_query_stdio().ok(),
             image_protocols: HashMap::new(),
         })
