@@ -118,6 +118,13 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
+        if let Some(hi) = r.hover_link {
+            if let Some(link) = rendered.link_map.links.get(hi) {
+                if link.line == idx {
+                    highlight_focused(&mut line, link, theme);
+                }
+            }
+        }
         if let Some(ci) = r.hover_checkbox {
             if let Some(cb) = rendered.checkbox_map.items.get(ci) {
                 if cb.line == idx {
