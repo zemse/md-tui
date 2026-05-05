@@ -39,6 +39,14 @@ pub struct CheckboxSpan {
     pub checked: bool,
 }
 
+/// Reference to an image embed in the rendered document. Ties the line where
+/// its placeholder lives to the resolved local path / URL.
+#[derive(Clone, Debug)]
+pub struct ImageRef {
+    pub line: usize,
+    pub source: PathBuf,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct CheckboxMap {
     pub items: Vec<CheckboxSpan>,

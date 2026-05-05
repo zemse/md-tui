@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::links::{self, CheckboxMap, CheckboxSpan, LinkMap, LinkSpan, LinkTarget};
+use crate::links::{self, CheckboxMap, CheckboxSpan, ImageRef, LinkMap, LinkSpan, LinkTarget};
 use crate::syntax;
 use crate::theme::Theme;
 
@@ -20,6 +20,7 @@ pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub link_map: LinkMap,
     pub checkbox_map: CheckboxMap,
+    pub images: Vec<ImageRef>,
     pub width: u16,
 }
 
@@ -48,6 +49,9 @@ struct Run {
     link: Option<usize>,
     /// Index into `checkboxes` if this run is the `[ ]`/`[x]` glyph of a task item.
     checkbox: Option<usize>,
+    /// Index into `images` if this run is an image placeholder. Recorded so
+    /// the layout pass can map (image idx → output line) for later rendering.
+    image: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +84,8 @@ struct Builder {
     links: Vec<PendingLink>,
     /// Pending task-list checkboxes awaiting layout — index referenced by `Run.checkbox`.
     checkboxes: Vec<PendingCheckbox>,
+    /// Image embed paths awaiting layout. Index is referenced by `Run.image`.
+    images: Vec<PathBuf>,
 
     // assembly state for current block
     cur_runs: Vec<Run>,
@@ -138,6 +144,7 @@ impl Builder {
             blocks: Vec::new(),
             links: Vec::new(),
             checkboxes: Vec::new(),
+            images: Vec::new(),
             cur_runs: Vec::new(),
             cur_prefix: Vec::new(),
             cur_hanging: Vec::new(),
@@ -177,6 +184,7 @@ impl Builder {
             style: Style::default().fg(self.theme.quote),
             link: None,
             checkbox: None,
+            image: None,
         }]
     }
 
@@ -196,14 +204,15 @@ impl Builder {
         let pad = " ".repeat(marker.chars().count());
         let style = Style::default().fg(self.theme.list_marker);
         let prefix = vec![
-            Run { text: indent.clone(), style: Style::default(), link: None, checkbox: None },
-            Run { text: marker, style, link: None, checkbox: None },
+            Run { text: indent.clone(), style: Style::default(), link: None, checkbox: None, image: None },
+            Run { text: marker, style, link: None, checkbox: None, image: None },
         ];
         let hanging = vec![Run {
             text: format!("{}{}", indent, pad),
             style: Style::default(),
             link: None,
             checkbox: None,
+            image: None,
         }];
         (prefix, hanging)
     }
@@ -234,6 +243,7 @@ impl Builder {
             style,
             link: self.open_link,
             checkbox: None,
+            image: None,
         });
     }
 
@@ -252,6 +262,7 @@ impl Builder {
                     style,
                     link: self.open_link,
                     checkbox: None,
+                    image: None,
                 });
                 if self.in_heading.is_some() {
                     self.heading_buf.push_str(&s);
@@ -265,6 +276,7 @@ impl Builder {
                     style,
                     link: self.open_link,
                     checkbox: None,
+                    image: None,
                 });
             }
             Event::SoftBreak => {
@@ -273,6 +285,7 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
+                    image: None,
                 });
             }
             Event::HardBreak => {
@@ -281,6 +294,7 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
+                    image: None,
                 });
             }
             Event::Rule => self.blocks.push(Block::Rule),
@@ -299,12 +313,14 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: Some(cb_idx),
+                    image: None,
                 });
                 self.cur_runs.push(Run {
                     text: " ".to_string(),
                     style: Style::default(),
                     link: None,
                     checkbox: None,
+                    image: None,
                 });
             }
             _ => {}
@@ -374,7 +390,20 @@ impl Builder {
                 } else {
                     format!("[image: {} ({})]", title, dest_url)
                 };
-                self.cur_runs.push(Run { text: label, style, link: None, checkbox: None });
+                // Resolve image path against the markdown file's base dir.
+                let resolved: PathBuf = match self.base_dir.as_ref() {
+                    Some(b) => b.join(dest_url.as_ref()),
+                    None => PathBuf::from(dest_url.as_ref()),
+                };
+                let img_idx = self.images.len();
+                self.images.push(resolved);
+                self.cur_runs.push(Run {
+                    text: label,
+                    style,
+                    link: None,
+                    checkbox: None,
+                    image: Some(img_idx),
+                });
             }
             Tag::Table(aligns) => {
                 self.table = Some(TableState {
@@ -398,6 +427,7 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: None,
+                    image: None,
                 });
             }
             _ => {}
@@ -447,6 +477,7 @@ impl Builder {
                                 style: sp.style,
                                 link: None,
                                 checkbox: None,
+                                image: None,
                             })
                             .collect()
                     })
@@ -504,7 +535,14 @@ impl Builder {
 
     fn finish(mut self) -> Rendered {
         self.finish_paragraph();
-        layout(&self.theme, self.width, self.blocks, self.links, self.checkboxes)
+        layout(
+            &self.theme,
+            self.width,
+            self.blocks,
+            self.links,
+            self.checkboxes,
+            self.images,
+        )
     }
 }
 
@@ -529,10 +567,12 @@ fn layout(
     blocks: Vec<Block>,
     links: Vec<PendingLink>,
     checkboxes: Vec<PendingCheckbox>,
+    images: Vec<PathBuf>,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut out_links: Vec<LinkSpan> = Vec::new();
     let mut out_checkboxes: Vec<CheckboxSpan> = Vec::new();
+    let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
 
     // For each link index, track the open span being built across runs.
@@ -568,6 +608,7 @@ fn layout(
                     &mut open_spans,
                     &mut out_checkboxes,
                     &checkboxes,
+                    &mut image_lines,
                 );
             }
             Block::Paragraph { runs, prefix, hanging } => {
@@ -582,6 +623,7 @@ fn layout(
                     &mut open_spans,
                     &mut out_checkboxes,
                     &checkboxes,
+                    &mut image_lines,
                 );
             }
             Block::Table { alignments, header, rows } => {
@@ -624,7 +666,18 @@ fn layout(
         anchors,
     };
     let checkbox_map = CheckboxMap { items: out_checkboxes };
-    Rendered { lines: out_lines, link_map, checkbox_map, width: width as u16 }
+    let images_out: Vec<ImageRef> = images
+        .into_iter()
+        .zip(image_lines.iter())
+        .filter_map(|(source, line)| line.map(|l| ImageRef { line: l, source }))
+        .collect();
+    Rendered {
+        lines: out_lines,
+        link_map,
+        checkbox_map,
+        images: images_out,
+        width: width as u16,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -649,6 +702,7 @@ fn wrap_runs(
     open_spans: &mut [Option<OpenSpan>],
     out_checkboxes: &mut Vec<CheckboxSpan>,
     checkboxes: &[PendingCheckbox],
+    image_lines: &mut [Option<usize>],
 ) {
     let prefix_width: usize = prefix.iter().map(|r| r.text.width()).sum();
     let hanging_width: usize = hanging.iter().map(|r| r.text.width()).sum();
@@ -731,6 +785,12 @@ fn wrap_runs(
     for run in runs {
         // Capture checkbox start position before emit; close after.
         let cb_start = run.checkbox.map(|ci| (ci, out_lines.len(), cur_col));
+        // Pin the image's output line at the moment its placeholder is emitted.
+        if let Some(ii) = run.image {
+            if let Some(slot) = image_lines.get_mut(ii) {
+                if slot.is_none() { *slot = Some(out_lines.len()); }
+            }
+        }
 
         // Switch link tracking if needed.
         if run.link != current_link {
@@ -1188,6 +1248,7 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
                     style: run.style,
                     link: run.link,
                     checkbox: run.checkbox,
+                    image: run.image,
                 });
             }
             break;
@@ -1198,6 +1259,7 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
         style: Style::default(),
         link: None,
         checkbox: None,
+        image: None,
     });
     out
 }

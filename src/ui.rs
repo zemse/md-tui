@@ -73,6 +73,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Reader(_) => draw_reader(f, app, body),
         View::Browser(_) => draw_browser(f, app, body),
     }
+    if matches!(app.view, View::Reader(_)) {
+        draw_images_overlay(f, app, body);
+    }
 
     draw_status(f, app, status);
 
@@ -133,7 +136,7 @@ fn display_path(p: &std::path::Path, root: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
+fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     let View::Reader(r) = &app.view else { return; };
     let Some(rendered) = &r.rendered else { return; };
     let theme = &app.opts.theme;
@@ -209,6 +212,59 @@ fn draw_reader(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(display_lines), body_area);
     draw_scrollbar(f, scrollbar_area, scroll, total, visible_h, theme);
+}
+
+/// Render any visible images in the document on top of the body, using the
+/// terminal's detected graphics protocol. No-op if the picker isn't available
+/// or if the image fails to decode.
+fn draw_images_overlay(f: &mut Frame, app: &mut App, body: Rect) {
+    use ratatui_image::StatefulImage;
+
+    if app.image_picker.is_none() { return; }
+    let (images, scroll) = match &app.view {
+        View::Reader(r) => match &r.rendered {
+            Some(rd) => (rd.images.clone(), r.scroll as i32),
+            None => return,
+        },
+        _ => return,
+    };
+
+    for img in &images {
+        let rel_y = img.line as i32 - scroll;
+        if rel_y < 0 || rel_y as u16 >= body.height { continue; }
+        let path = match std::fs::canonicalize(&img.source) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !app.image_protocols.contains_key(&path) {
+            let dyn_img = match image::ImageReader::open(&path) {
+                Ok(rdr) => match rdr.decode() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let proto = match app.image_picker.as_ref() {
+                Some(p) => p.new_resize_protocol(dyn_img),
+                None => continue,
+            };
+            app.image_protocols.insert(path.clone(), proto);
+        }
+        let proto = match app.image_protocols.get_mut(&path) {
+            Some(p) => p,
+            None => continue,
+        };
+        let max_h = body.height.saturating_sub(rel_y as u16);
+        let h = 12u16.min(max_h);
+        if h == 0 { continue; }
+        let area = Rect {
+            x: body.x,
+            y: body.y + rel_y as u16,
+            width: body.width.saturating_sub(1),
+            height: h,
+        };
+        f.render_stateful_widget(StatefulImage::default(), area, proto);
+    }
 }
 
 /// Vertical scrollbar with a thumb sized proportionally to the visible viewport
@@ -330,7 +386,18 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = b
         .entries
         .iter()
-        .map(|e| ListItem::new(Span::styled(e.display.clone(), browser_entry_style(e.kind, theme))))
+        .map(|e| {
+            let indent = "  ".repeat(e.depth);
+            let prefix = match e.kind {
+                BrowserEntryKind::Dir => {
+                    if b.expanded.contains(&e.path) { "▾ " } else { "▸ " }
+                }
+                BrowserEntryKind::Markdown => "  ",
+                BrowserEntryKind::ParentDir => "",
+            };
+            let label = format!("{}{}{}", indent, prefix, e.display);
+            ListItem::new(Span::styled(label, browser_entry_style(e.kind, theme)))
+        })
         .collect();
     let list = List::new(items)
         .highlight_style(
@@ -509,7 +576,7 @@ fn describe_target(t: &LinkTarget) -> String {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let w = 60.min(area.width.saturating_sub(4));
-    let h = 28.min(area.height.saturating_sub(4));
+    let h = 30.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect { x, y, width: w, height: h };
@@ -523,7 +590,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  u / PgUp     half/page up"),
         Line::from("  g / G        top / bottom"),
         Line::from("  Tab / S-Tab  next / prev link"),
-        Line::from("  Enter        open dir / file / link"),
+        Line::from("  Enter        open file / toggle dir expansion / link"),
+        Line::from("  → / ←        expand-or-open / collapse-or-parent"),
         Line::from("  /            in-doc text search (Reader) / file search (Browser)"),
         Line::from("  n / N        next / prev match"),
         Line::from("  T            fuzzy file search (anywhere)"),

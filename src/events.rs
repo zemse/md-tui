@@ -96,6 +96,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
 
+        // Tree expansion (Browser only).
+        KeyCode::Right => expand_or_open(app)?,
+        KeyCode::Left => collapse_or_parent(app)?,
+
         _ => {}
     }
     Ok(())
@@ -350,6 +354,59 @@ fn scroll_to(app: &mut App, line: u16) {
     }
 }
 
+/// Right-arrow: expand a directory inline; on a file, open it.
+fn expand_or_open(app: &mut App) -> Result<()> {
+    if let View::Browser(b) = &mut app.view {
+        if let Some(entry) = b.entries.get(b.selected).cloned() {
+            match entry.kind {
+                BrowserEntryKind::Dir => {
+                    if !b.expanded.contains(&entry.path) {
+                        b.toggle_expand(b.selected)?;
+                    } else {
+                        // already expanded — move into first child
+                        let next = b.selected + 1;
+                        if b.entries.get(next).map(|e| e.depth > entry.depth).unwrap_or(false) {
+                            b.selected = next;
+                        }
+                    }
+                    return Ok(());
+                }
+                BrowserEntryKind::Markdown => {
+                    app.navigate_to(EntryKind::File(entry.path), 0)?;
+                    return Ok(());
+                }
+                BrowserEntryKind::ParentDir => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Left-arrow: if the selected entry is an expanded directory, collapse it;
+/// otherwise jump to the parent entry that contains the current depth.
+fn collapse_or_parent(app: &mut App) -> Result<()> {
+    if let View::Browser(b) = &mut app.view {
+        if let Some(entry) = b.entries.get(b.selected).cloned() {
+            if entry.kind == BrowserEntryKind::Dir && b.expanded.contains(&entry.path) {
+                b.toggle_expand(b.selected)?;
+                return Ok(());
+            }
+            // Walk up to a parent entry (lower depth).
+            if entry.depth > 0 {
+                let mut i = b.selected;
+                while i > 0 {
+                    i -= 1;
+                    if b.entries[i].depth < entry.depth {
+                        b.selected = i;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn focus_next_link(app: &mut App) {
     if let View::Reader(r) = &mut app.view {
         let Some(rendered) = &r.rendered else { return; };
@@ -416,8 +473,16 @@ fn activate(app: &mut App) -> Result<()> {
 
 fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
     match entry.kind {
-        BrowserEntryKind::ParentDir | BrowserEntryKind::Dir => {
+        // Parent: leave the tree and re-root one directory up.
+        BrowserEntryKind::ParentDir => {
             app.navigate_to(EntryKind::Directory(entry.path), 0)?;
+        }
+        // Inline-expand a directory in place.
+        BrowserEntryKind::Dir => {
+            if let View::Browser(b) = &mut app.view {
+                let idx = b.selected;
+                b.toggle_expand(idx)?;
+            }
         }
         BrowserEntryKind::Markdown => {
             app.navigate_to(EntryKind::File(entry.path), 0)?;

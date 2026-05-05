@@ -27,31 +27,39 @@ cat NOTES.md | md # read from stdin
 
 ## Features
 
-- **Mouse-aware** — wheel to scroll, click links to follow, hover for highlight.
+- **Mouse-aware** — wheel to scroll, click links to follow, hover for highlight, click `‹ Back` in the header.
 - **Clickable task lists** — click `- [ ]` / `- [x]` to toggle; the file is rewritten in place.
 - **Native text selection** — press `m` to drop mouse capture and drag-select with the terminal.
+- **In-document search** — `/` in Reader, then `n`/`N` to step matches; `T` for fuzzy file search.
+- **Recursive file tree** — directories expand inline; `→` opens, `←` collapses; gitignore-aware.
+- **Wiki links** — `[[Page]]` / `[[Page|Display]]` resolve relative to the current file or anywhere under the launch root.
+- **Image rendering** — kitty / iTerm2 / sixel / unicode halfblocks via `ratatui-image` when supported.
+- **`$EDITOR` integration** — press `e` to edit the current file; the TUI restores after the editor exits.
+- **Header bar** — current path with a clickable back button.
 - **Proportional scrollbar** — thumb size reflects how much of the document is visible.
-- **Fuzzy file search** — `/` opens an overlay that walks the launch directory.
-- **Directory browser** — only directories and `.md` files; `..` to go up.
 - **History** — `h`/`l` (or `b`/`f`) walk back and forward; cursor and scroll position are remembered.
 - **Themes** — Catppuccin Mocha / Latte; auto-selects from `COLORFGBG`, override with `-s dark|light`.
 - **GitHub-flavored** — tables, strikethrough, footnotes, task lists, code-block syntax highlighting (syntect), heading anchors.
 
 ## Keys
 
-| Key            | Action                               |
-| -------------- | ------------------------------------ |
-| `j` / `k`      | Scroll down / up                     |
-| `d` / `u`      | Half page down / up                  |
-| `g` / `G`      | Top / bottom                         |
-| `Tab` / `S-Tab`| Next / previous link                 |
-| `Enter`        | Open selected entry / focused link   |
-| `o`            | Open focused link in system browser  |
-| `/`            | Fuzzy search                         |
-| `h` / `l`      | Back / forward in history            |
-| `m`            | Toggle mouse capture (drag-to-select)|
-| `?`            | Help                                 |
-| `q` / `Esc`    | Quit / go back                       |
+| Key            | Action                                                 |
+| -------------- | ------------------------------------------------------ |
+| `j` / `k`      | Scroll down / up                                       |
+| `d` / `u`      | Half page down / up                                    |
+| `g` / `G`      | Top / bottom                                           |
+| `Tab` / `S-Tab`| Next / previous link                                   |
+| `Enter`        | Open file / toggle dir expansion / follow link         |
+| `→` / `←`      | Expand-or-open / collapse-or-parent (tree)             |
+| `/`            | In-doc search (Reader) / fuzzy file search (Browser)   |
+| `n` / `N`      | Next / previous in-doc match                           |
+| `T`            | Fuzzy file search (anywhere)                           |
+| `o`            | Open focused link in system browser                    |
+| `e`            | Edit current file in `$EDITOR`                         |
+| `h` / `l`      | Back / forward in history                              |
+| `m`            | Toggle mouse capture (drag-to-select)                  |
+| `?`            | Help                                                   |
+| `q` / `Esc`    | Quit / dismiss search / go back one level              |
 
 ## Config
 

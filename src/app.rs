@@ -6,6 +6,9 @@ use ratatui::layout::Rect;
 use crate::links::LinkTarget;
 use crate::markdown::{self, Rendered};
 use crate::theme::Theme;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -41,6 +44,11 @@ pub struct App {
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
+    /// Detected terminal image protocol. `None` if the terminal can't render
+    /// images (then we fall back to placeholder text).
+    pub image_picker: Option<Picker>,
+    /// Lazily-decoded image protocol cache, keyed by canonicalised path.
+    pub image_protocols: HashMap<PathBuf, StatefulProtocol>,
 }
 
 pub enum View {
@@ -100,6 +108,8 @@ pub struct Browser {
     pub entries: Vec<BrowserEntry>,
     pub selected: usize,
     pub scroll: u16,
+    /// Set of directory paths that are currently expanded in the tree view.
+    pub expanded: std::collections::HashSet<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -107,6 +117,8 @@ pub struct BrowserEntry {
     pub path: PathBuf,
     pub display: String,
     pub kind: BrowserEntryKind,
+    /// Indentation depth for tree rendering. 0 = top level.
+    pub depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +175,8 @@ impl App {
             header_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
             mouse_enabled: true,
+            image_picker: Picker::from_query_stdio().ok(),
+            image_protocols: HashMap::new(),
         })
     }
 
@@ -472,6 +486,67 @@ fn canonicalize_or(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
+/// One-level directory listing into `out`, dirs-first then markdown files,
+/// sorted case-insensitively. Recurses into directories that are present in
+/// `expanded`. Honours .gitignore via the `ignore` crate.
+fn push_children(
+    dir: &Path,
+    depth: usize,
+    expanded: &std::collections::HashSet<PathBuf>,
+    out: &mut Vec<BrowserEntry>,
+) {
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let walker = ignore::WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(false)
+        .build();
+    for result in walker {
+        let entry = match result { Ok(e) => e, Err(_) => continue };
+        if entry.path() == dir { continue; }
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let path = entry.path().to_path_buf();
+        let ft = match entry.file_type() { Some(f) => f, None => continue };
+        if ft.is_dir() {
+            dirs.push((name, path));
+        } else if ft.is_file() && is_markdown_file(&path) {
+            files.push((name, path));
+        }
+    }
+    let by_name = |a: &(String, PathBuf), b: &(String, PathBuf)| {
+        a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+    };
+    dirs.sort_by(by_name);
+    files.sort_by(by_name);
+    for (name, path) in dirs {
+        let is_expanded = expanded.contains(&path);
+        out.push(BrowserEntry {
+            path: path.clone(),
+            display: format!("{}/", name),
+            kind: BrowserEntryKind::Dir,
+            depth,
+        });
+        if is_expanded {
+            push_children(&path, depth + 1, expanded, out);
+        }
+    }
+    for (name, path) in files {
+        out.push(BrowserEntry {
+            path,
+            display: name,
+            kind: BrowserEntryKind::Markdown,
+            depth,
+        });
+    }
+}
+
 /// Case-insensitive substring search across the rendered lines, mapped to
 /// (line, col_start, col_end) in display-width coordinates so the highlight
 /// aligns with what the user sees.
@@ -556,72 +631,60 @@ impl Reader {
 }
 
 impl Browser {
-    /// One-level directory listing: a `..` entry (if there is a parent),
-    /// then sub-directories, then markdown files; each group sorted
-    /// case-insensitively. Non-markdown files are skipped — this is a
-    /// markdown reader, not a generic file picker. Honours .gitignore /
-    /// .ignore through the `ignore` crate.
+    /// Build a tree-style listing rooted at `dir`. Top level always starts
+    /// with a `..` entry (when not at filesystem root); below that, dirs are
+    /// listed before files. Sub-directories are expanded inline only if their
+    /// path is in `expanded`. Non-markdown files are skipped, .gitignored
+    /// entries are skipped via the `ignore` crate.
     pub fn scan(dir: &Path) -> Result<Self> {
+        let mut b = Self {
+            dir: dir.to_path_buf(),
+            entries: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            expanded: std::collections::HashSet::new(),
+        };
+        b.rebuild()?;
+        Ok(b)
+    }
+
+    /// Rebuild `entries` from `dir` + `expanded` set. Preserves selection
+    /// where possible by keeping the highlighted path stable across rebuilds.
+    pub fn rebuild(&mut self) -> Result<()> {
+        let prev_selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
         let mut entries = Vec::new();
-        if let Some(parent) = dir.parent() {
-            if parent != dir {
+        if let Some(parent) = self.dir.parent() {
+            if parent != self.dir {
                 entries.push(BrowserEntry {
                     path: parent.to_path_buf(),
                     display: "../".to_string(),
                     kind: BrowserEntryKind::ParentDir,
+                    depth: 0,
                 });
             }
         }
-        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-        let mut files: Vec<(String, PathBuf)> = Vec::new();
-        let walker = ignore::WalkBuilder::new(dir)
-            .max_depth(Some(1))
-            .hidden(true)
-            .git_ignore(true)
-            .git_exclude(true)
-            .git_global(true)
-            .require_git(false)
-            .build();
-        for result in walker {
-            let entry = match result { Ok(e) => e, Err(_) => continue };
-            if entry.path() == dir { continue; }
-            let name = match entry.file_name().to_str() {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            let path = entry.path().to_path_buf();
-            let ft = match entry.file_type() { Some(f) => f, None => continue };
-            if ft.is_dir() {
-                dirs.push((name, path));
-            } else if ft.is_file() && is_markdown_file(&path) {
-                files.push((name, path));
-            }
-        }
-        let by_name = |a: &(String, PathBuf), b: &(String, PathBuf)| {
-            a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+        push_children(&self.dir, 0, &self.expanded, &mut entries);
+        self.entries = entries;
+        self.selected = match prev_selected_path {
+            Some(p) => self.entries.iter().position(|e| e.path == p).unwrap_or(0),
+            None => 0,
         };
-        dirs.sort_by(by_name);
-        files.sort_by(by_name);
-        for (name, path) in dirs {
-            entries.push(BrowserEntry {
-                path,
-                display: format!("{}/", name),
-                kind: BrowserEntryKind::Dir,
-            });
+        Ok(())
+    }
+
+    /// Toggle expansion of the directory at `idx`. No-op for non-dir entries.
+    /// Rebuilds entries after the toggle.
+    pub fn toggle_expand(&mut self, idx: usize) -> Result<()> {
+        let path = match self.entries.get(idx) {
+            Some(e) if e.kind == BrowserEntryKind::Dir => e.path.clone(),
+            _ => return Ok(()),
+        };
+        if self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+        } else {
+            self.expanded.insert(path);
         }
-        for (name, path) in files {
-            entries.push(BrowserEntry {
-                path,
-                display: name,
-                kind: BrowserEntryKind::Markdown,
-            });
-        }
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            entries,
-            selected: 0,
-            scroll: 0,
-        })
+        self.rebuild()
     }
 
     #[allow(dead_code)]
@@ -880,6 +943,39 @@ mod tests {
             View::Reader(r) => assert_eq!(r.scroll, 1, "scroll should be restored"),
             _ => panic!(),
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browser_tree_expands_directory_inline() {
+        let dir = fresh_temp("tree-expand");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("top.md"), "# top").unwrap();
+        std::fs::write(dir.join("sub/inner.md"), "# inner").unwrap();
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let View::Browser(b) = &mut app.view else { panic!(); };
+
+        // Initially `sub/` is collapsed; only top-level entries listed.
+        assert!(b.entries.iter().any(|e| e.display == "sub/" && e.depth == 0));
+        assert!(!b.entries.iter().any(|e| e.display == "inner.md"));
+
+        // Find the sub/ index and expand.
+        let idx = b.entries.iter().position(|e| e.display == "sub/").unwrap();
+        b.toggle_expand(idx).unwrap();
+
+        // inner.md must now appear at depth 1, right after sub/.
+        let inner_pos = b
+            .entries
+            .iter()
+            .position(|e| e.display == "inner.md")
+            .expect("inner.md should be visible after expand");
+        assert_eq!(b.entries[inner_pos].depth, 1);
+
+        // Collapse — inner.md disappears again.
+        b.toggle_expand(idx).unwrap();
+        assert!(!b.entries.iter().any(|e| e.display == "inner.md"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
