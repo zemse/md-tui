@@ -10,7 +10,7 @@ pub struct Config {
 
 pub fn load() -> Config {
     let path = match dirs::config_dir() {
-        Some(d) => d.join("md-tui").join("config.toml"),
+        Some(d) => d.join("md").join("config.toml"),
         None => return Config::default(),
     };
     let Ok(text) = std::fs::read_to_string(&path) else { return Config::default(); };

@@ -853,7 +853,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "md-tui"
+name = "md-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
