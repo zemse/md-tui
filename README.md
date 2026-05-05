@@ -60,3 +60,7 @@ line_numbers = false
 ```
 
 CLI flags override the config: `-s dark|light|auto`, `-w 100`, `-l`.
+
+## License
+
+[MIT](LICENSE)

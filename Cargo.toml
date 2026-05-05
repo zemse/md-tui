@@ -2,6 +2,14 @@
 name = "md-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal markdown reader with mouse support, clickable links and task lists, fuzzy search, and a directory browser."
+license = "MIT"
+repository = "https://github.com/zemse/md-tui"
+homepage = "https://github.com/zemse/md-tui"
+readme = "README.md"
+keywords = ["markdown", "tui", "terminal", "viewer", "reader"]
+categories = ["command-line-utilities", "text-processing"]
+authors = ["Soham Zemse"]
 
 [[bin]]
 name = "md"
