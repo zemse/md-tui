@@ -324,9 +324,9 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     Ok(())
 }
 
-/// Select the word under the click and push it to the system clipboard via
-/// OSC 52, which works on every modern terminal without needing a clipboard
-/// crate. Updates the status bar with the copied text.
+/// Select the word under the click and push it to the system clipboard.
+/// Uses `pbcopy` on macOS (always works locally) and OSC 52 elsewhere /
+/// as a fallback so it still works over SSH. Updates the status bar.
 fn select_word_at(app: &mut App, col: u16, row: u16) {
     let area = app.viewport;
     if !point_in(area, col, row) { return; }
@@ -345,13 +345,42 @@ fn select_word_at(app: &mut App, col: u16, row: u16) {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let Some(word) = word_at_col(&text, local_col) else { return; };
 
+    copy_to_clipboard(&word);
+    app.status = format!("Copied: {}", word);
+}
+
+/// Best-effort copy: native helper on macOS, OSC 52 otherwise (with tmux
+/// passthrough wrapping when applicable). Both paths are silent on failure —
+/// the status line already reports what we attempted to copy.
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return;
+        }
+    }
+    osc52_copy(text);
+}
+
+fn osc52_copy(text: &str) {
     use std::io::Write;
     use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(word.as_bytes());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut out = stdout();
-    let _ = write!(out, "\x1b]52;c;{}\x07", encoded);
+    if std::env::var_os("TMUX").is_some() {
+        // tmux DCS passthrough: tmux strips the wrapper and forwards the inner
+        // OSC 52 to the outer terminal.
+        let _ = write!(out, "\x1bPtmux;\x1b\x1b]52;c;{}\x07\x1b\\", encoded);
+    } else {
+        let _ = write!(out, "\x1b]52;c;{}\x1b\\", encoded);
+    }
     let _ = out.flush();
-    app.status = format!("Copied: {}", word);
 }
 
 #[cfg(test)]
