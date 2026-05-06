@@ -309,15 +309,15 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     let area = app.viewport;
     if !point_in(area, m.column, m.row) {
         match m.kind {
-            MouseEventKind::ScrollUp => scroll_by(app, -3),
-            MouseEventKind::ScrollDown => scroll_by(app, 3),
+            MouseEventKind::ScrollUp => wheel_scroll(app, -3),
+            MouseEventKind::ScrollDown => wheel_scroll(app, 3),
             _ => {}
         }
         return Ok(());
     }
     match m.kind {
-        MouseEventKind::ScrollUp => scroll_by(app, -3),
-        MouseEventKind::ScrollDown => scroll_by(app, 3),
+        MouseEventKind::ScrollUp => wheel_scroll(app, -3),
+        MouseEventKind::ScrollDown => wheel_scroll(app, 3),
         MouseEventKind::Moved => {
             update_hover(app, m.column, m.row);
         }
@@ -404,6 +404,91 @@ fn osc52_copy(text: &str) {
 }
 
 #[cfg(test)]
+mod scroll_damp_tests {
+    use super::compute_dampened_scroll;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_event_passes_through_at_full_strength() {
+        let mut last = None;
+        let mut accum = 0.0;
+        let d = compute_dampened_scroll(&mut last, &mut accum, 3, Instant::now());
+        assert_eq!(d, 3);
+    }
+
+    #[test]
+    fn slow_scroll_keeps_full_speed() {
+        let mut last = None;
+        let mut accum = 0.0;
+        let t0 = Instant::now();
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t0), 3);
+        // 250ms later — past the burst threshold; full delta passes through.
+        let t1 = t0 + Duration::from_millis(250);
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t1), 3);
+    }
+
+    #[test]
+    fn rapid_burst_is_halved_overall() {
+        let mut last = None;
+        let mut accum = 0.0;
+        let t0 = Instant::now();
+        // First event sets the clock; treat it as the start of the burst.
+        let _ = compute_dampened_scroll(&mut last, &mut accum, 3, t0);
+        // Six follow-up events 50ms apart — all in the burst zone (factor 0.5).
+        let mut total = 0;
+        for i in 1..=6 {
+            let t = t0 + Duration::from_millis(50 * i);
+            total += compute_dampened_scroll(&mut last, &mut accum, 3, t);
+        }
+        // Raw would have been 6 * 3 = 18 lines; dampened ≈ 9.
+        assert_eq!(total, 9, "burst of 6 events at 3 lines should yield ~9 dampened");
+    }
+
+    #[test]
+    fn fractional_accumulator_is_preserved() {
+        let mut last = None;
+        let mut accum = 0.0;
+        let t0 = Instant::now();
+        let _ = compute_dampened_scroll(&mut last, &mut accum, 3, t0);
+        // 50ms later: 3 * 0.5 = 1.5 lines → 1 line emitted, 0.5 carried.
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t1), 1);
+        // 50ms later again: 1.5 + 0.5 carry = 2.0 lines → 2 emitted, 0 carried.
+        let t2 = t1 + Duration::from_millis(50);
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t2), 2);
+    }
+
+    #[test]
+    fn long_pause_resets_accumulator() {
+        let mut accum = 0.7;
+        let now = Instant::now();
+        // Pretend the last event was way back; elapsed > 500ms.
+        let mut last = Some(now - Duration::from_secs(2));
+        let _ = compute_dampened_scroll(&mut last, &mut accum, 3, now);
+        // Accum should have been zeroed before this event's contribution.
+        // After a 2-second gap, factor=1.0, so 3 lines emitted, accum back to 0.
+        assert!(accum.abs() < 1e-4, "accum should reset on long pause, got {}", accum);
+    }
+
+    #[test]
+    fn direction_reversal_resets_carry() {
+        let mut last = None;
+        let mut accum = 0.0;
+        let t0 = Instant::now();
+        let _ = compute_dampened_scroll(&mut last, &mut accum, 3, t0);
+        // Build positive carry.
+        let t1 = t0 + Duration::from_millis(50);
+        let _ = compute_dampened_scroll(&mut last, &mut accum, 3, t1);
+        assert!(accum > 0.0);
+        // Reverse direction — leftover positive carry must not cancel the
+        // first up-scroll line.
+        let t2 = t1 + Duration::from_millis(50);
+        let d = compute_dampened_scroll(&mut last, &mut accum, -3, t2);
+        assert!(d <= -1, "reversal should still emit a line in the new direction, got {}", d);
+    }
+}
+
+#[cfg(test)]
 mod word_tests {
     use super::word_at_col;
 
@@ -482,6 +567,55 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
 
 fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Mouse-wheel scroll with rate-aware dampening: deliberate single ticks
+/// (>200ms apart) pass through at full strength; rapid bursts get scaled
+/// down to 0.5× so trackpad momentum scrolls don't fly off the page. The
+/// fractional accumulator on `App` carries sub-line credit across events
+/// so the user sees smooth movement instead of stutter.
+fn wheel_scroll(app: &mut App, raw_delta: i32) {
+    let now = std::time::Instant::now();
+    let dampened = compute_dampened_scroll(
+        &mut app.last_scroll_at,
+        &mut app.scroll_accum,
+        raw_delta,
+        now,
+    );
+    if dampened != 0 {
+        scroll_by(app, dampened);
+    }
+}
+
+/// Pure dampening logic, factored out for tests. The `now` parameter lets
+/// callers feed deterministic timestamps. Updates `last_at` and `accum`
+/// in place; returns the integer-line delta to apply to scroll position.
+fn compute_dampened_scroll(
+    last_at: &mut Option<std::time::Instant>,
+    accum: &mut f32,
+    requested: i32,
+    now: std::time::Instant,
+) -> i32 {
+    let elapsed_ms = last_at
+        .map(|t| now.duration_since(t).as_millis() as u32)
+        .unwrap_or(u32::MAX);
+    // Long pause → drop fractional credit so a scroll started minutes ago
+    // doesn't suddenly move an extra line on the next event.
+    if elapsed_ms > 500 {
+        *accum = 0.0;
+    }
+    // Reverse direction → reset, otherwise leftover credit in one direction
+    // would silently absorb the first line of the opposite scroll.
+    if (*accum > 0.0 && requested < 0) || (*accum < 0.0 && requested > 0) {
+        *accum = 0.0;
+    }
+    // Linear ramp: ≤100ms apart → 0.5× (burst), ≥200ms → 1.0× (deliberate).
+    let factor = ((elapsed_ms as f32) / 200.0).clamp(0.5, 1.0);
+    *accum += (requested as f32) * factor;
+    let lines = accum.trunc() as i32;
+    *accum -= lines as f32;
+    *last_at = Some(now);
+    lines
 }
 
 fn scroll_by(app: &mut App, delta: i32) {

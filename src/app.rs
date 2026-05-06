@@ -47,6 +47,13 @@ pub struct App {
     /// Most recent left-mouse-down (Instant + column + row), used to detect
     /// double-clicks for word selection.
     pub last_click: Option<(std::time::Instant, u16, u16)>,
+    /// Sub-line accumulator for wheel-scroll dampening. Carries fractional
+    /// lines across events so a halved scroll factor still produces smooth
+    /// movement instead of "stuck" frames where nothing happens.
+    pub scroll_accum: f32,
+    /// Timestamp of the most recent wheel scroll event. `None` until the
+    /// first wheel tick. Used to detect bursts.
+    pub last_scroll_at: Option<std::time::Instant>,
     /// Detected terminal image protocol. `None` if the terminal can't render
     /// images (then we fall back to placeholder text).
     pub image_picker: Option<Picker>,
@@ -179,6 +186,8 @@ impl App {
             back_button_hit: None,
             mouse_enabled: true,
             last_click: None,
+            scroll_accum: 0.0,
+            last_scroll_at: None,
             image_picker: Picker::from_query_stdio().ok(),
             image_protocols: HashMap::new(),
         })
