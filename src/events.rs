@@ -64,13 +64,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     return Ok(());
                 }
             }
-            // Walk back through history. At the root we deliberately do
-            // nothing — quitting is reserved for `q` and Ctrl+C so an
-            // accidental Esc never drops the user out of the app.
+            // Walk back through history; at the root, Esc quits.
             if !app.history.is_empty() {
                 app.go_back()?;
             } else {
-                app.status = "At root — press q or Ctrl-C to quit".into();
+                app.should_quit = true;
             }
         }
         KeyCode::Char('?') => app.help_open = !app.help_open,

@@ -580,7 +580,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  g / G        top / bottom"),
         Line::from("  Tab / S-Tab  next / prev link"),
         Line::from("  Enter / →    open file / enter directory / follow link"),
-        Line::from("  Esc / ←      back   (parent directory or previous view)"),
+        Line::from("  Esc / ←      back   (parent directory or previous view; Esc at root quits)"),
         Line::from("  /            in-doc text search (Reader) / file search (Browser)"),
         Line::from("  n / N        next / prev match"),
         Line::from("  T            fuzzy file search (anywhere)"),
