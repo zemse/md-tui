@@ -188,9 +188,17 @@ impl App {
             last_click: None,
             scroll_accum: 0.0,
             last_scroll_at: None,
-            image_picker: Picker::from_query_stdio().ok(),
+            image_picker: None,
             image_protocols: HashMap::new(),
         })
+    }
+
+    /// Probe the terminal for graphics-protocol support. Must be called after
+    /// the alternate screen is active — the probe writes a query to stdout
+    /// and reads the reply from stdin, and any unrecognized escape bytes
+    /// would otherwise be left on the user's main screen.
+    pub fn init_image_picker(&mut self) {
+        self.image_picker = Picker::from_query_stdio().ok();
     }
 
     pub fn record_current(&self) -> HistoryEntry {

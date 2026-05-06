@@ -68,6 +68,9 @@ fn main() -> Result<()> {
 
     let mut app = app::App::new(source, opts)?;
     let mut term = ui::setup_terminal()?;
+    // Probe for graphics support only after entering the alt screen, so any
+    // unrecognized response bytes don't pollute the user's shell on exit.
+    app.init_image_picker();
 
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
