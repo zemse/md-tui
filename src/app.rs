@@ -83,6 +83,10 @@ pub struct Reader {
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
     pub doc_search: Option<DocSearch>,
+    /// (mtime, size) snapshot of the source file at last read. Used by the
+    /// event loop to detect external edits and reload. `None` for stdin or
+    /// when the metadata wasn't available at load time.
+    pub last_meta: Option<(std::time::SystemTime, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +334,38 @@ impl App {
         }
     }
 
+    /// Cheap external-change check, called every event-loop tick. Stats the
+    /// open file; if (mtime, size) differs from the recorded fingerprint, the
+    /// content is re-read and the cached render is dropped. Returns `true`
+    /// when the on-screen content actually changed (mtime touched but byte-
+    /// identical content does not count). No-op for stdin or non-Reader views.
+    pub fn poll_external_change(&mut self) -> bool {
+        let View::Reader(r) = &mut self.view else { return false };
+        let path = match &r.origin {
+            ReaderOrigin::File(p) => p.clone(),
+            ReaderOrigin::Stdin => return false,
+        };
+        let Some(new_meta) = file_meta(&path) else { return false };
+        if r.last_meta.as_ref() == Some(&new_meta) { return false; }
+        // Fingerprint moved — re-read and decide whether content actually
+        // changed. A transient read failure (editor mid-rename, etc.) is
+        // ignored; we'll retry on the next tick.
+        let Ok(new_raw) = std::fs::read_to_string(&path) else { return false };
+        r.last_meta = Some(new_meta);
+        if new_raw == r.raw { return false; }
+        r.raw = new_raw;
+        r.rendered = None;
+        r.hover_link = None;
+        r.hover_checkbox = None;
+        r.focused_link = None;
+        if let Some(ds) = &mut r.doc_search {
+            ds.matches.clear();
+            ds.current = 0;
+        }
+        self.status = "File reloaded".into();
+        true
+    }
+
     /// Flip the `[ ]`/`[x]` task marker at `idx` and persist to the source file.
     /// No-op for stdin sources. Drops the cached render so the next draw
     /// reflects the new state.
@@ -350,6 +386,9 @@ impl App {
             let path = p.clone();
             std::fs::write(&path, &r.raw)
                 .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+            // Refresh fingerprint so the watcher doesn't see our own write
+            // as an external change and trigger a redundant reload.
+            r.last_meta = file_meta(&path);
             self.status = if was_checked { "Unchecked".into() } else { "Checked".into() };
         } else {
             self.status = "Toggled (in-memory; stdin not persisted)".into();
@@ -606,6 +645,11 @@ fn vault_lookup(root: &Path, target: &Path) -> Option<PathBuf> {
 
 impl Reader {
     pub fn from_file(path: &Path) -> Result<Self> {
+        // Capture metadata BEFORE reading content: if a writer races us between
+        // these two syscalls, our recorded mtime is older than the file's
+        // actual mtime and the next watcher tick will reload. The other order
+        // would silently swallow the concurrent edit.
+        let last_meta = file_meta(path);
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
         Ok(Self {
@@ -617,6 +661,7 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
+            last_meta,
         })
     }
 
@@ -630,8 +675,17 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
+            last_meta: None,
         }
     }
+}
+
+/// Cheap stat read; returns `None` if the file is gone or unstatable. Called
+/// every event-loop tick — must not allocate or do anything beyond a single
+/// `metadata` syscall (kernel serves this from the inode cache).
+pub fn file_meta(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.modified().ok()?, md.len()))
 }
 
 impl Browser {
@@ -868,6 +922,65 @@ mod tests {
         app.toggle_checkbox(1).unwrap();
         let after_second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after_second, "- [x] alpha\n- [ ] beta\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poll_external_change_reloads_when_file_edited() {
+        let dir = fresh_temp("watch-reload");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "# original\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        // Steady-state tick should be a no-op even after rendering.
+        assert!(!app.poll_external_change());
+
+        // Some filesystems have second-resolution mtime — bump it so the
+        // fingerprint definitely shifts. Belt-and-suspenders: the file
+        // length also changes.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&path, "# updated content\n").unwrap();
+
+        assert!(app.poll_external_change(), "expected reload after edit");
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "# updated content\n"),
+            _ => panic!("expected reader view"),
+        }
+        // A second poll with no further edits should not reload again.
+        assert!(!app.poll_external_change());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poll_external_change_ignores_byte_identical_touches() {
+        let dir = fresh_temp("watch-touch");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "# same\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Rewrite identical content — mtime moves but content doesn't.
+        std::fs::write(&path, "# same\n").unwrap();
+
+        assert!(!app.poll_external_change(), "no-op rewrite must not signal a reload");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkbox_toggle_does_not_self_trigger_reload() {
+        let dir = fresh_temp("watch-self-write");
+        let path = dir.join("t.md");
+        std::fs::write(&path, "- [ ] task\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.toggle_checkbox(0).unwrap();
+        // Our own write must refresh the fingerprint so the watcher tick
+        // immediately afterwards does not see a phantom external change.
+        assert!(!app.poll_external_change());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -13,6 +13,10 @@ use crate::ui;
 
 pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        // Detect external edits to the open file. One stat syscall per tick
+        // (≤4/sec when idle, served from the kernel inode cache) — far
+        // cheaper than a notification thread, and zero new dependencies.
+        app.poll_external_change();
         term.draw(|f| ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? { continue; }
         match event::read()? {
