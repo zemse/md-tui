@@ -386,18 +386,7 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = b
         .entries
         .iter()
-        .map(|e| {
-            let indent = "  ".repeat(e.depth);
-            let prefix = match e.kind {
-                BrowserEntryKind::Dir => {
-                    if b.expanded.contains(&e.path) { "▾ " } else { "▸ " }
-                }
-                BrowserEntryKind::Markdown => "  ",
-                BrowserEntryKind::ParentDir => "",
-            };
-            let label = format!("{}{}{}", indent, prefix, e.display);
-            ListItem::new(Span::styled(label, browser_entry_style(e.kind, theme)))
-        })
+        .map(|e| ListItem::new(Span::styled(e.display.clone(), browser_entry_style(e.kind, theme))))
         .collect();
     let list = List::new(items)
         .highlight_style(
@@ -590,8 +579,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  u / PgUp     half/page up"),
         Line::from("  g / G        top / bottom"),
         Line::from("  Tab / S-Tab  next / prev link"),
-        Line::from("  Enter        open file / toggle dir expansion / link"),
-        Line::from("  → / ←        expand-or-open / collapse-or-parent"),
+        Line::from("  Enter / →    open file / enter directory / follow link"),
+        Line::from("  Esc / ←      back   (parent directory or previous view)"),
         Line::from("  /            in-doc text search (Reader) / file search (Browser)"),
         Line::from("  n / N        next / prev match"),
         Line::from("  T            fuzzy file search (anywhere)"),
@@ -600,7 +589,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  e            edit current file in $EDITOR"),
         Line::from("  o            open in browser (focused link)"),
         Line::from("  m            toggle mouse (drag-to-select)"),
-        Line::from("  q / Esc      quit"),
+        Line::from("  q / Ctrl-C   quit"),
         Line::from("  ?            toggle this help"),
         Line::from(""),
         Line::from("  In search:   type to filter, ↑/↓ navigate,"),

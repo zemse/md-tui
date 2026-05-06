@@ -31,7 +31,7 @@ cat NOTES.md | md # read from stdin
 - **Clickable task lists** — click `- [ ]` / `- [x]` to toggle; the file is rewritten in place.
 - **Native text selection** — press `m` to drop mouse capture and drag-select with the terminal.
 - **In-document search** — `/` in Reader, then `n`/`N` to step matches; `T` for fuzzy file search.
-- **Recursive file tree** — directories expand inline; `→` opens, `←` collapses; gitignore-aware.
+- **Directory browser** — full-screen one-level listing; `Enter`/`→` opens or descends, `Esc`/`←` walks back; gitignore-aware.
 - **Wiki links** — `[[Page]]` / `[[Page|Display]]` resolve relative to the current file or anywhere under the launch root.
 - **Image rendering** — kitty / iTerm2 / sixel / unicode halfblocks via `ratatui-image` when supported.
 - **`$EDITOR` integration** — press `e` to edit the current file; the TUI restores after the editor exits.
@@ -49,8 +49,8 @@ cat NOTES.md | md # read from stdin
 | `d` / `u`      | Half page down / up                                    |
 | `g` / `G`      | Top / bottom                                           |
 | `Tab` / `S-Tab`| Next / previous link                                   |
-| `Enter`        | Open file / toggle dir expansion / follow link         |
-| `→` / `←`      | Expand-or-open / collapse-or-parent (tree)             |
+| `Enter` / `→`  | Open file / enter directory / follow link              |
+| `Esc` / `←`    | Back (parent directory or previous view)               |
 | `/`            | In-doc search (Reader) / fuzzy file search (Browser)   |
 | `n` / `N`      | Next / previous in-doc match                           |
 | `T`            | Fuzzy file search (anywhere)                           |
@@ -59,7 +59,7 @@ cat NOTES.md | md # read from stdin
 | `h` / `l`      | Back / forward in history                              |
 | `m`            | Toggle mouse capture (drag-to-select)                  |
 | `?`            | Help                                                   |
-| `q` / `Esc`    | Quit / dismiss search / go back one level              |
+| `q` / `Ctrl-C` | Quit                                                   |
 
 ## Config
 

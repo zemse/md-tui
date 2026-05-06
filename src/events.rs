@@ -34,6 +34,11 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // Ctrl+C is a hard exit no matter what overlay is on screen.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return Ok(());
+    }
     if app.help_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => app.help_open = false,
@@ -59,11 +64,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     return Ok(());
                 }
             }
-            // Otherwise back out of nested navigation; quit only at the root.
+            // Walk back through history. At the root we deliberately do
+            // nothing — quitting is reserved for `q` and Ctrl+C so an
+            // accidental Esc never drops the user out of the app.
             if !app.history.is_empty() {
                 app.go_back()?;
             } else {
-                app.should_quit = true;
+                app.status = "At root — press q or Ctrl-C to quit".into();
             }
         }
         KeyCode::Char('?') => app.help_open = !app.help_open,
@@ -76,9 +83,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
         KeyCode::Char('e') => edit_current_file(app)?,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
 
         // Navigation
         KeyCode::Char('h') | KeyCode::Char('b') | KeyCode::Backspace => app.go_back()?,
@@ -100,9 +104,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
 
-        // Tree expansion (Browser only).
-        KeyCode::Right => expand_or_open(app)?,
-        KeyCode::Left => collapse_or_parent(app)?,
+        // Browser navigation: Right enters a directory / opens a file,
+        // Left walks back via history.
+        KeyCode::Right => enter_or_open(app)?,
+        KeyCode::Left => {
+            if matches!(app.view, View::Browser(_)) { app.go_back()?; }
+        }
 
         _ => {}
     }
@@ -179,6 +186,11 @@ fn toggle_mouse(app: &mut App) {
 
 /// Handle keystrokes while the in-document search prompt is open.
 fn handle_doc_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // Ctrl+C always quits, even with overlays open.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return Ok(());
+    }
     match key.code {
         KeyCode::Esc => app.close_doc_search(),
         KeyCode::Enter => app.doc_search_commit(),
@@ -206,6 +218,10 @@ fn handle_doc_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return Ok(());
+    }
     match key.code {
         KeyCode::Esc => app.close_search(),
         KeyCode::Enter => {
@@ -509,55 +525,16 @@ fn scroll_to(app: &mut App, line: u16) {
     }
 }
 
-/// Right-arrow: expand a directory inline; on a file, open it.
-fn expand_or_open(app: &mut App) -> Result<()> {
-    if let View::Browser(b) = &mut app.view {
-        if let Some(entry) = b.entries.get(b.selected).cloned() {
-            match entry.kind {
-                BrowserEntryKind::Dir => {
-                    if !b.expanded.contains(&entry.path) {
-                        b.toggle_expand(b.selected)?;
-                    } else {
-                        // already expanded — move into first child
-                        let next = b.selected + 1;
-                        if b.entries.get(next).map(|e| e.depth > entry.depth).unwrap_or(false) {
-                            b.selected = next;
-                        }
-                    }
-                    return Ok(());
-                }
-                BrowserEntryKind::Markdown => {
-                    app.navigate_to(EntryKind::File(entry.path), 0)?;
-                    return Ok(());
-                }
-                BrowserEntryKind::ParentDir => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Left-arrow: if the selected entry is an expanded directory, collapse it;
-/// otherwise jump to the parent entry that contains the current depth.
-fn collapse_or_parent(app: &mut App) -> Result<()> {
-    if let View::Browser(b) = &mut app.view {
-        if let Some(entry) = b.entries.get(b.selected).cloned() {
-            if entry.kind == BrowserEntryKind::Dir && b.expanded.contains(&entry.path) {
-                b.toggle_expand(b.selected)?;
-                return Ok(());
-            }
-            // Walk up to a parent entry (lower depth).
-            if entry.depth > 0 {
-                let mut i = b.selected;
-                while i > 0 {
-                    i -= 1;
-                    if b.entries[i].depth < entry.depth {
-                        b.selected = i;
-                        return Ok(());
-                    }
-                }
-            }
-        }
+/// Right-arrow / Enter on a Browser: navigate into a directory (replacing
+/// the current view, pushing it onto history) or open a file. No-op
+/// outside Browser.
+fn enter_or_open(app: &mut App) -> Result<()> {
+    let entry = match &app.view {
+        View::Browser(b) => b.entries.get(b.selected).cloned(),
+        _ => return Ok(()),
+    };
+    if let Some(entry) = entry {
+        activate_browser_entry(app, entry)?;
     }
     Ok(())
 }
@@ -628,16 +605,9 @@ fn activate(app: &mut App) -> Result<()> {
 
 fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
     match entry.kind {
-        // Parent: leave the tree and re-root one directory up.
-        BrowserEntryKind::ParentDir => {
+        // Parent / dir: re-root the browser one level. Reader files: open.
+        BrowserEntryKind::ParentDir | BrowserEntryKind::Dir => {
             app.navigate_to(EntryKind::Directory(entry.path), 0)?;
-        }
-        // Inline-expand a directory in place.
-        BrowserEntryKind::Dir => {
-            if let View::Browser(b) = &mut app.view {
-                let idx = b.selected;
-                b.toggle_expand(idx)?;
-            }
         }
         BrowserEntryKind::Markdown => {
             app.navigate_to(EntryKind::File(entry.path), 0)?;

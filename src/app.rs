@@ -115,8 +115,6 @@ pub struct Browser {
     pub entries: Vec<BrowserEntry>,
     pub selected: usize,
     pub scroll: u16,
-    /// Set of directory paths that are currently expanded in the tree view.
-    pub expanded: std::collections::HashSet<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -124,8 +122,6 @@ pub struct BrowserEntry {
     pub path: PathBuf,
     pub display: String,
     pub kind: BrowserEntryKind,
-    /// Indentation depth for tree rendering. 0 = top level.
-    pub depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,15 +525,9 @@ fn canonicalize_or(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
-/// One-level directory listing into `out`, dirs-first then markdown files,
-/// sorted case-insensitively. Recurses into directories that are present in
-/// `expanded`. Honours .gitignore via the `ignore` crate.
-fn push_children(
-    dir: &Path,
-    depth: usize,
-    expanded: &std::collections::HashSet<PathBuf>,
-    out: &mut Vec<BrowserEntry>,
-) {
+/// Flat one-level listing of `dir`: dirs-first, then markdown files, both
+/// sorted case-insensitively. Honours .gitignore via the `ignore` crate.
+fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let walker = ignore::WalkBuilder::new(dir)
@@ -569,23 +559,17 @@ fn push_children(
     dirs.sort_by(by_name);
     files.sort_by(by_name);
     for (name, path) in dirs {
-        let is_expanded = expanded.contains(&path);
         out.push(BrowserEntry {
-            path: path.clone(),
+            path,
             display: format!("{}/", name),
             kind: BrowserEntryKind::Dir,
-            depth,
         });
-        if is_expanded {
-            push_children(&path, depth + 1, expanded, out);
-        }
     }
     for (name, path) in files {
         out.push(BrowserEntry {
             path,
             display: name,
             kind: BrowserEntryKind::Markdown,
-            depth,
         });
     }
 }
@@ -689,25 +673,23 @@ pub fn file_meta(path: &Path) -> Option<(std::time::SystemTime, u64)> {
 }
 
 impl Browser {
-    /// Build a tree-style listing rooted at `dir`. Top level always starts
-    /// with a `..` entry (when not at filesystem root); below that, dirs are
-    /// listed before files. Sub-directories are expanded inline only if their
-    /// path is in `expanded`. Non-markdown files are skipped, .gitignored
-    /// entries are skipped via the `ignore` crate.
+    /// Build a flat one-level listing of `dir`. The first entry is `..` when
+    /// `dir` has a parent (so users who launched directly into a sub-tree can
+    /// still walk up); below that, dirs come before markdown files, both
+    /// sorted case-insensitively. .gitignored entries are skipped.
     pub fn scan(dir: &Path) -> Result<Self> {
         let mut b = Self {
             dir: dir.to_path_buf(),
             entries: Vec::new(),
             selected: 0,
             scroll: 0,
-            expanded: std::collections::HashSet::new(),
         };
         b.rebuild()?;
         Ok(b)
     }
 
-    /// Rebuild `entries` from `dir` + `expanded` set. Preserves selection
-    /// where possible by keeping the highlighted path stable across rebuilds.
+    /// Rebuild `entries` from `dir`. Preserves the highlighted path across
+    /// rebuilds when possible.
     pub fn rebuild(&mut self) -> Result<()> {
         let prev_selected_path = self.entries.get(self.selected).map(|e| e.path.clone());
         let mut entries = Vec::new();
@@ -717,32 +699,16 @@ impl Browser {
                     path: parent.to_path_buf(),
                     display: "../".to_string(),
                     kind: BrowserEntryKind::ParentDir,
-                    depth: 0,
                 });
             }
         }
-        push_children(&self.dir, 0, &self.expanded, &mut entries);
+        push_children(&self.dir, &mut entries);
         self.entries = entries;
         self.selected = match prev_selected_path {
             Some(p) => self.entries.iter().position(|e| e.path == p).unwrap_or(0),
             None => 0,
         };
         Ok(())
-    }
-
-    /// Toggle expansion of the directory at `idx`. No-op for non-dir entries.
-    /// Rebuilds entries after the toggle.
-    pub fn toggle_expand(&mut self, idx: usize) -> Result<()> {
-        let path = match self.entries.get(idx) {
-            Some(e) if e.kind == BrowserEntryKind::Dir => e.path.clone(),
-            _ => return Ok(()),
-        };
-        if self.expanded.contains(&path) {
-            self.expanded.remove(&path);
-        } else {
-            self.expanded.insert(path);
-        }
-        self.rebuild()
     }
 
     #[allow(dead_code)]
@@ -1065,34 +1031,44 @@ mod tests {
     }
 
     #[test]
-    fn browser_tree_expands_directory_inline() {
-        let dir = fresh_temp("tree-expand");
+    fn browser_navigate_into_subdir_and_back() {
+        let dir = fresh_temp("flat-nav-back");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner/note.md"), "# note").unwrap();
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        app.navigate_to(EntryKind::Directory(dir.join("inner")), 0).unwrap();
+        match &app.view {
+            View::Browser(b) => assert_eq!(b.dir, dir.join("inner")),
+            _ => panic!("expected browser at inner/"),
+        }
+        app.go_back().unwrap();
+        match &app.view {
+            View::Browser(b) => assert_eq!(b.dir, dir),
+            _ => panic!("expected browser at root after back"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browser_lists_one_level_only() {
+        let dir = fresh_temp("flat-listing");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("top.md"), "# top").unwrap();
         std::fs::write(dir.join("sub/inner.md"), "# inner").unwrap();
 
-        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
-        let View::Browser(b) = &mut app.view else { panic!(); };
-
-        // Initially `sub/` is collapsed; only top-level entries listed.
-        assert!(b.entries.iter().any(|e| e.display == "sub/" && e.depth == 0));
+        // Top-level browser shows `sub/` and `top.md` but never recurses into
+        // `sub/`, so `inner.md` must not appear.
+        let b = Browser::scan(&dir).unwrap();
+        assert!(b.entries.iter().any(|e| e.display == "sub/"));
+        assert!(b.entries.iter().any(|e| e.display == "top.md"));
         assert!(!b.entries.iter().any(|e| e.display == "inner.md"));
 
-        // Find the sub/ index and expand.
-        let idx = b.entries.iter().position(|e| e.display == "sub/").unwrap();
-        b.toggle_expand(idx).unwrap();
-
-        // inner.md must now appear at depth 1, right after sub/.
-        let inner_pos = b
-            .entries
-            .iter()
-            .position(|e| e.display == "inner.md")
-            .expect("inner.md should be visible after expand");
-        assert_eq!(b.entries[inner_pos].depth, 1);
-
-        // Collapse — inner.md disappears again.
-        b.toggle_expand(idx).unwrap();
-        assert!(!b.entries.iter().any(|e| e.display == "inner.md"));
+        // Scanning the sub-directory directly is the only way to see its
+        // contents — that's what activating `sub/` does in the event handler.
+        let sub = Browser::scan(&dir.join("sub")).unwrap();
+        assert!(sub.entries.iter().any(|e| e.display == "inner.md"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
