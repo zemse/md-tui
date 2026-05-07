@@ -120,8 +120,11 @@ enum Block {
     Paragraph { runs: Vec<Run>, prefix: Vec<Run>, hanging: Vec<Run> },
     /// Heading — word-wrapped, anchor recorded.
     Heading { runs: Vec<Run>, anchor: String },
-    /// Pre-formatted block — rendered line-by-line, not wrapped.
-    Pre { lines: Vec<Vec<Run>>, prefix: Vec<Run> },
+    /// Pre-formatted block — rendered line-by-line, not wrapped. `flat` is
+    /// true for the synthetic raw block produced by edit-mode substitution:
+    /// it skips the 2-col left pad and code background so the on-screen
+    /// content lines up with the view-mode rendering of the same source.
+    Pre { lines: Vec<Vec<Run>>, prefix: Vec<Run>, flat: bool },
     /// Table — column-aligned with box-drawing borders.
     Table {
         alignments: Vec<Alignment>,
@@ -580,7 +583,7 @@ impl Builder {
                     .collect();
                 let prefix = self.quote_prefix();
                 self.code_content.clear();
-                self.push_block(Block::Pre { lines, prefix }, range);
+                self.push_block(Block::Pre { lines, prefix, flat: false }, range);
                 self.push_blank();
             }
             TagEnd::List(_) => {
@@ -802,9 +805,10 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
     let slice = source.get(range.clone()).unwrap_or("");
     let style = Style::default().fg(theme.muted);
     let cursor_in_block = cursor.saturating_sub(range.start);
-    // Pre block adds a 2-col left pad in layout, so the inner usable width
-    // is `width - 2`. Clamp to ≥1 so we always make progress.
-    let inner_width = width.saturating_sub(2).max(1);
+    // Flat raw blocks render with no left pad / chrome (see Block::Pre
+    // layout), so wrap to the full configured width — same as the view-mode
+    // paragraph wrap, which is what the user expects (no visual reflow).
+    let inner_width = width.max(1);
 
     let mut lines: Vec<Vec<Run>> = Vec::new();
     let mut byte_idx = 0usize;
@@ -842,7 +846,7 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
     // Render with no left-pad / quote-bar prefix so the raw text aligns to
     // column 0 — that lets the cursor display position math match the
     // source-line column directly.
-    Block::Pre { lines, prefix: Vec::new() }
+    Block::Pre { lines, prefix: Vec::new(), flat: true }
 }
 
 fn heading_idx(l: HeadingLevel) -> usize {
@@ -937,20 +941,25 @@ fn layout(
             Block::Table { alignments, header, rows } => {
                 layout_table(theme, &alignments, &header, &rows, width, &mut out_lines, &mut out_links, &links);
             }
-            Block::Pre { lines, prefix } => {
-                let pad_left = "  ";
+            Block::Pre { lines, prefix, flat } => {
+                // Flat = edit-mode raw substitution: skip the 2-col left pad
+                // and code background so the rendered output lines up
+                // visually with view-mode formatting of the same source.
+                let pad_left = if flat { "" } else { "  " };
                 let prefix_width = prefix.iter().map(|r| r.text.width()).sum::<usize>() + pad_left.width();
-                let bg = theme.code_bg;
+                let bg = if flat { None } else { theme.code_bg };
                 for line_runs in lines {
                     let line_y = out_lines.len() as u16;
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     for r in &prefix {
                         spans.push(Span::styled(r.text.clone(), r.style));
                     }
-                    spans.push(Span::styled(
-                        pad_left.to_string(),
-                        Style::default().bg_opt(bg),
-                    ));
+                    if !pad_left.is_empty() {
+                        spans.push(Span::styled(
+                            pad_left.to_string(),
+                            Style::default().bg_opt(bg),
+                        ));
+                    }
                     let mut content_w = 0usize;
                     let mut col_offset = prefix_width as u16;
                     for r in line_runs {
