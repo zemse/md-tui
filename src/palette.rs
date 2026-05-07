@@ -22,12 +22,37 @@ pub fn depth() -> ColorDepth {
 }
 
 fn detect() -> ColorDepth {
+    // Strongest signal: explicit `COLORTERM` advertisement. Honored even on
+    // Apple Terminal so a user can force-upgrade if Apple ever adds support.
     if let Ok(v) = std::env::var("COLORTERM") {
         let v = v.to_ascii_lowercase();
         if v == "truecolor" || v == "24bit" {
             return ColorDepth::TrueColor;
         }
     }
+
+    // Apple Terminal.app advertises 256 colors only and does not support
+    // truecolor as of macOS 15. Pin it down even if `COLORTERM` got stripped
+    // (e.g. by ssh) so we don't fall through to a hopeful TERM-based guess.
+    if let Ok(p) = std::env::var("TERM_PROGRAM") {
+        if p == "Apple_Terminal" {
+            return ColorDepth::Indexed256;
+        }
+        // Known truecolor-capable terminal emulators that may not set
+        // COLORTERM after env stripping.
+        if matches!(p.as_str(), "iTerm.app" | "vscode" | "WezTerm" | "ghostty" | "Hyper") {
+            return ColorDepth::TrueColor;
+        }
+    }
+
+    // `xterm-direct`, `*-direct`, and `*-truecolor` terminfo entries advertise
+    // direct color. Kitty also identifies itself this way.
+    if let Ok(t) = std::env::var("TERM") {
+        if t.ends_with("-direct") || t.contains("truecolor") || t == "xterm-kitty" {
+            return ColorDepth::TrueColor;
+        }
+    }
+
     ColorDepth::Indexed256
 }
 
