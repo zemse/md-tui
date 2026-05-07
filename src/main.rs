@@ -3,6 +3,7 @@ mod config;
 mod events;
 mod links;
 mod markdown;
+mod palette;
 mod syntax;
 mod theme;
 mod ui;

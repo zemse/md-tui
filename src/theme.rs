@@ -1,5 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::palette;
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Theme {
@@ -31,20 +33,20 @@ impl Theme {
         // Palette: Catppuccin Mocha — pastel hues designed for dark-bg readability.
         // Avoids low-luminance blues (the default ANSI LightBlue ~ #5f87ff) that
         // wash out against #1e1e1e-class terminal backgrounds.
-        let mauve = Color::Rgb(0xcb, 0xa6, 0xf7);
-        let sky = Color::Rgb(0x89, 0xdc, 0xeb);
-        let lavender = Color::Rgb(0xb4, 0xbe, 0xfe);
-        let yellow = Color::Rgb(0xf9, 0xe2, 0xaf);
-        let green = Color::Rgb(0xa6, 0xe3, 0xa1);
-        let peach = Color::Rgb(0xfa, 0xb3, 0x87);
-        let subtext1 = Color::Rgb(0xba, 0xc2, 0xde);
-        let subtext0 = Color::Rgb(0xa6, 0xad, 0xc8);
-        let overlay1 = Color::Rgb(0x7f, 0x84, 0x9c);
-        let surface2 = Color::Rgb(0x58, 0x5b, 0x70);
+        let mauve = palette::rgb(0xcb, 0xa6, 0xf7);
+        let sky = palette::rgb(0x89, 0xdc, 0xeb);
+        let lavender = palette::rgb(0xb4, 0xbe, 0xfe);
+        let yellow = palette::rgb(0xf9, 0xe2, 0xaf);
+        let green = palette::rgb(0xa6, 0xe3, 0xa1);
+        let peach = palette::rgb(0xfa, 0xb3, 0x87);
+        let subtext1 = palette::rgb(0xba, 0xc2, 0xde);
+        let subtext0 = palette::rgb(0xa6, 0xad, 0xc8);
+        let overlay1 = palette::rgb(0x7f, 0x84, 0x9c);
+        let surface2 = palette::rgb(0x58, 0x5b, 0x70);
         // Surface1 (lifted +1 from surface0) so code blocks remain visibly
         // distinct from common terminal backgrounds (#1e1e1e..#2d2d2d).
-        let surface1 = Color::Rgb(0x45, 0x47, 0x5a);
-        let crust = Color::Rgb(0x11, 0x11, 0x1b);
+        let surface1 = palette::rgb(0x45, 0x47, 0x5a);
+        let crust = palette::rgb(0x11, 0x11, 0x1b);
         Theme {
             name: "dark".into(),
             fg: Color::Reset,
@@ -72,22 +74,22 @@ impl Theme {
     pub fn light() -> Self {
         // Palette: Catppuccin Latte — darker pastels with strong contrast on
         // light terminal backgrounds (#eff1f5-class).
-        let mauve = Color::Rgb(0x88, 0x39, 0xef);
-        let blue = Color::Rgb(0x1e, 0x66, 0xf5);
-        let teal = Color::Rgb(0x17, 0x9d, 0x9c);
-        let yellow = Color::Rgb(0xdf, 0x8e, 0x1d);
-        let green = Color::Rgb(0x40, 0xa0, 0x2b);
+        let mauve = palette::rgb(0x88, 0x39, 0xef);
+        let blue = palette::rgb(0x1e, 0x66, 0xf5);
+        let teal = palette::rgb(0x17, 0x9d, 0x9c);
+        let yellow = palette::rgb(0xdf, 0x8e, 0x1d);
+        let green = palette::rgb(0x40, 0xa0, 0x2b);
         // Red (not Peach) for code/link-focus: peach #fe640b only reaches
         // ~3:1 contrast on a near-white code bg, failing WCAG AA. Red gives ~5:1.
-        let red = Color::Rgb(0xd2, 0x0f, 0x39);
-        let subtext1 = Color::Rgb(0x5c, 0x5f, 0x77);
-        let subtext0 = Color::Rgb(0x6c, 0x6f, 0x85);
-        let overlay1 = Color::Rgb(0x8c, 0x8f, 0xa1);
-        let surface1 = Color::Rgb(0xbc, 0xc0, 0xcc);
+        let red = palette::rgb(0xd2, 0x0f, 0x39);
+        let subtext1 = palette::rgb(0x5c, 0x5f, 0x77);
+        let subtext0 = palette::rgb(0x6c, 0x6f, 0x85);
+        let overlay1 = palette::rgb(0x8c, 0x8f, 0xa1);
+        let surface1 = palette::rgb(0xbc, 0xc0, 0xcc);
         // Mantle (lighter than surface0) — gentler code background that still
         // separates from a white terminal bg.
-        let mantle = Color::Rgb(0xe6, 0xe9, 0xef);
-        let base = Color::Rgb(0xef, 0xf1, 0xf5);
+        let mantle = palette::rgb(0xe6, 0xe9, 0xef);
+        let base = palette::rgb(0xef, 0xf1, 0xf5);
         Theme {
             name: "light".into(),
             fg: Color::Reset,

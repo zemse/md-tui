@@ -1,10 +1,12 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+
+use crate::palette;
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
 static THEMES: OnceLock<ThemeSet> = OnceLock::new();
@@ -46,7 +48,7 @@ pub fn highlight(code: &str, lang_token: Option<&str>, theme_name: &str, out: &m
 }
 
 fn syn_to_ratatui(s: SynStyle) -> Style {
-    let mut style = Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b));
+    let mut style = Style::default().fg(palette::rgb(s.foreground.r, s.foreground.g, s.foreground.b));
     if s.font_style.contains(FontStyle::BOLD) { style = style.add_modifier(Modifier::BOLD); }
     if s.font_style.contains(FontStyle::ITALIC) { style = style.add_modifier(Modifier::ITALIC); }
     if s.font_style.contains(FontStyle::UNDERLINE) { style = style.add_modifier(Modifier::UNDERLINED); }
