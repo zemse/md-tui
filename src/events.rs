@@ -845,7 +845,11 @@ fn scroll_by(app: &mut App, delta: i32) {
         View::Browser(b) => {
             let n = b.entries.len() as i32;
             if n == 0 { return; }
-            let new = (b.selected as i32 + delta).clamp(0, n - 1) as usize;
+            // Wrap-around: pressing `k` at the top jumps to the last entry,
+            // pressing `j` at the bottom jumps back to the first. rem_euclid
+            // handles negative dividends correctly so a `-1` delta from
+            // index 0 lands on `n-1`.
+            let new = (b.selected as i32 + delta).rem_euclid(n) as usize;
             b.selected = new;
             // Keep selection visible. Account for the bordered title row.
             let h = app.viewport.height.saturating_sub(2) as usize;
