@@ -568,6 +568,8 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             // Double-click → select & copy the word under the cursor.
+            // (Pre-existing behaviour, fires on the second Down so the user
+            // gets immediate feedback without waiting for Up.)
             let now = std::time::Instant::now();
             let double = match app.last_click {
                 Some((t, c, r)) => {
@@ -580,13 +582,133 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             app.last_click = Some((now, m.column, m.row));
             if double {
                 select_word_at(app, m.column, m.row);
-            } else {
-                click_at(app, m.column, m.row)?;
+                app.pending_click = None;
+                app.selection = None;
+                return Ok(());
+            }
+            // Single Down: defer the click action until Up so a Drag can
+            // claim the gesture as a selection. Set the selection anchor
+            // to the down position; selection only "activates" once a Drag
+            // arrives with a different position.
+            app.pending_click = Some((m.column, m.row));
+            if let Some((line_idx, col)) = body_pos(app, m.column, m.row) {
+                app.selection = Some(crate::app::Selection {
+                    anchor_line: line_idx,
+                    anchor_col: col,
+                    focus_line: line_idx,
+                    focus_col: col,
+                    dragged: false,
+                });
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((line_idx, col)) = body_pos(app, m.column, m.row) {
+                if let Some(s) = app.selection.as_mut() {
+                    s.focus_line = line_idx;
+                    s.focus_col = col;
+                    if !s.dragged
+                        && (s.anchor_line != s.focus_line || s.anchor_col != s.focus_col)
+                    {
+                        s.dragged = true;
+                        // Drag claimed the gesture; cancel the pending click
+                        // so Up doesn't follow a link the user was trying to
+                        // copy text from.
+                        app.pending_click = None;
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // If the selection turned into a real drag, copy and exit.
+            let copied = if let Some(s) = app.selection.take() {
+                if s.is_active() {
+                    if let Some(text) = extract_selection_text(app, &s) {
+                        if !text.is_empty() {
+                            copy_to_clipboard(&text);
+                            app.status = format!("Copied {} chars", text.chars().count());
+                            true
+                        } else { false }
+                    } else { false }
+                } else { false }
+            } else { false };
+            if copied {
+                app.pending_click = None;
+                return Ok(());
+            }
+            // No drag → fire the deferred click target (link / checkbox /
+            // browser entry). This preserves the click-to-follow behaviour
+            // that existed before drag-select was introduced.
+            if let Some((c, r)) = app.pending_click.take() {
+                click_at(app, c, r)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Convert a screen (col, row) to a body-local (line_index, display_col).
+/// Returns `None` if the point is outside the body or before the line-number
+/// gutter. line_index is the index into `Rendered::lines` so it survives
+/// scrolling mid-drag.
+fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
+    let body = app.viewport;
+    if row < body.y || row >= body.y + body.height { return None; }
+    if col < body.x { return None; }
+    let line_num_w = if app.opts.line_numbers {
+        match &app.view {
+            View::Reader(r) => match &r.rendered {
+                Some(rd) => (format!("{}", rd.lines.len()).len() + 1) as u16,
+                None => 0,
+            },
+            _ => 0,
+        }
+    } else { 0 };
+    if col < body.x + line_num_w { return None; }
+    let scroll = match &app.view {
+        View::Reader(r) => r.scroll as usize,
+        View::Browser(b) => b.scroll as usize,
+    };
+    let local_row = (row - body.y) as usize;
+    let local_col = col - body.x - line_num_w;
+    Some((scroll + local_row, local_col))
+}
+
+/// Extract the text covered by a selection, walking `Rendered::lines` and
+/// slicing each line by display columns. Inserts `\n` between lines. Returns
+/// `None` if the reader hasn't been rendered yet.
+fn extract_selection_text(app: &App, sel: &crate::app::Selection) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+    let View::Reader(r) = &app.view else { return None };
+    let rd = r.rendered.as_ref()?;
+    let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
+    let last = rd.lines.len().saturating_sub(1);
+    let mut out = String::new();
+    for li in s_line..=e_line.min(last) {
+        let line = &rd.lines[li];
+        let from = if li == s_line { s_col as usize } else { 0 };
+        let to = if li == e_line { e_col as usize } else { usize::MAX };
+        let mut col = 0usize;
+        let mut wrote_any = false;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                let w = ch.width().unwrap_or(0);
+                let next = col + w;
+                if col >= from && next <= to {
+                    out.push(ch);
+                    wrote_any = true;
+                }
+                col = next;
+                if col >= to { break; }
+            }
+            if col >= to { break; }
+        }
+        let _ = wrote_any;
+        if li < e_line.min(last) {
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Select the word under the click and push it to the system clipboard.

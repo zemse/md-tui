@@ -65,6 +65,9 @@ pub struct App {
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
+    /// In-app text selection state. Set on first Drag after Mouse Down,
+    /// cleared on Up (after copying) or any view-mutating action.
+    pub selection: Option<Selection>,
     /// Git lens overlay state. `Some` while the user has Ctrl-G toggled on.
     /// Holds the parsed diff vs HEAD (staged + unstaged combined) for the
     /// current file. `None` otherwise.
@@ -72,6 +75,10 @@ pub struct App {
     /// Most recent left-mouse-down (Instant + column + row), used to detect
     /// double-clicks for word selection.
     pub last_click: Option<(std::time::Instant, u16, u16)>,
+    /// On left-mouse-down we stash a pending single-click target. It fires
+    /// on Up only if no Drag arrived in between (so drag-select doesn't
+    /// also navigate).
+    pub pending_click: Option<(u16, u16)>,
     /// Sub-line accumulator for wheel-scroll dampening. Carries fractional
     /// lines across events so a halved scroll factor still produces smooth
     /// movement instead of "stuck" frames where nothing happens.
@@ -154,6 +161,36 @@ pub struct EditSnapshot {
 /// Soft cap on undo depth. Picked to balance memory (each snapshot is one
 /// String clone) against typical editing sessions.
 pub const UNDO_LIMIT: usize = 200;
+
+/// In-app drag-select state. Anchor and focus are stored in (line_index,
+/// display_col) where line_index is the row in `Rendered::lines` (so
+/// scrolling mid-drag doesn't tear the range). Anchor stays put once set;
+/// focus moves with the mouse on each Drag event.
+#[derive(Clone, Copy, Debug)]
+pub struct Selection {
+    pub anchor_line: usize,
+    pub anchor_col: u16,
+    pub focus_line: usize,
+    pub focus_col: u16,
+    /// True once the user has dragged at least one cell; pure clicks
+    /// (Down + Up with no Drag) leave this false and don't trigger copy.
+    pub dragged: bool,
+}
+
+impl Selection {
+    /// Return the (start, end) pair in document order, regardless of
+    /// drag direction.
+    pub fn normalized(&self) -> ((usize, u16), (usize, u16)) {
+        let a = (self.anchor_line, self.anchor_col);
+        let b = (self.focus_line, self.focus_col);
+        if a <= b { (a, b) } else { (b, a) }
+    }
+    /// True if the selection covers any non-empty range.
+    pub fn is_active(&self) -> bool {
+        self.dragged
+            && (self.anchor_line != self.focus_line || self.anchor_col != self.focus_col)
+    }
+}
 
 /// Pre-parsed `git diff HEAD -- <file>` content. Each entry is a single
 /// display row tagged with how it should be styled. We deliberately keep
@@ -290,6 +327,8 @@ impl App {
             last_mouse_col: 0,
             last_mouse_row: 0,
             mouse_enabled: true,
+            selection: None,
+            pending_click: None,
             git_lens: None,
             last_click: None,
             scroll_accum: 0.0,
@@ -1839,6 +1878,40 @@ index abc..def 100644\n\
                 DiffRowKind::Context,
             ],
         );
+    }
+
+    #[test]
+    fn long_paragraph_wraps_in_edit_mode_with_cursor_on_correct_row() {
+        let dir = fresh_temp("edit-wrap");
+        let path = dir.join("long.md");
+        // Single source line, much wider than the render width (40), with
+        // the cursor near the end. Without wrap, the cursor would be off
+        // screen.
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon";
+        std::fs::write(&path, body).unwrap();
+
+        let mut o = opts();
+        o.width = 40;
+        let mut app = App::new(Source::File(path.clone()), o).unwrap();
+        app.viewport = Rect::new(0, 0, 40, 24);
+        app.ensure_rendered(40);
+        app.enter_edit();
+        // Move the cursor near the end of the buffer so it should be on
+        // a wrapped row well below the first.
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().cursor = body.len() - 5;
+        }
+        app.ensure_rendered(40);
+
+        let View::Reader(r) = &app.view else { panic!() };
+        let rd = r.rendered.as_ref().unwrap();
+        let xy = rd.cursor_xy.expect("cursor should have a display position");
+        // Cursor must land on a row > 0 (the line wrapped) AND its column
+        // must be inside the body width.
+        assert!(xy.1 > 0, "expected cursor on wrapped row, got {:?}", xy);
+        assert!(xy.0 < 40, "cursor col should fit within render width, got {:?}", xy);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

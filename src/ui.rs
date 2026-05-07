@@ -196,6 +196,26 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(display_lines), body_area);
     draw_scrollbar(f, scrollbar_area, scroll, total, visible_h, theme);
 
+    // Drag-select overlay: paint reverse-video over the selection range.
+    // Drawn before the cursor so the cursor halo wins on top.
+    if let Some(sel) = app.selection.filter(|s| s.is_active()) {
+        let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
+        let buf = f.buffer_mut();
+        for li in s_line..=e_line {
+            let cy_view = li as i32 - r.scroll as i32;
+            if cy_view < 0 || cy_view as u16 >= body_area.height { continue; }
+            let row = body_area.y + cy_view as u16;
+            let from = if li == s_line { s_col as usize } else { 0 };
+            let to = if li == e_line { e_col as usize } else { body_area.width as usize };
+            for c in from..to {
+                let x = body_area.x + c as u16;
+                if x >= body_area.x + body_area.width { break; }
+                let cell = &mut buf[(x, row)];
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+
     // Edit mode: paint the source cursor as a reverse-video cell on top of
     // the body. Doing this *after* rendering the paragraph keeps the cursor
     // visible regardless of the underlying span's foreground/background.

@@ -664,10 +664,15 @@ impl Builder {
                     _ => false,
                 };
                 if !did_inline {
+                    // Pre-wrap to the configured width so long source
+                    // lines (e.g. an unbroken paragraph) display as
+                    // multiple wrapped rows with the cursor on the right
+                    // wrapped row instead of running off the right edge.
                     entry.block = make_raw_block(
                         &self.source,
                         &entry.source_range,
                         cursor,
+                        self.width,
                         &self.theme,
                     );
                 }
@@ -684,6 +689,52 @@ impl Builder {
             self.edit,
         )
     }
+}
+
+/// Break `s` into chunks each ≤ `max_w` display columns. Splits on whitespace
+/// when possible; for a single word longer than `max_w`, splits mid-word at
+/// char boundaries. Each chunk records its byte range within `s` so the
+/// edit-mode cursor can land on the right wrapped row.
+fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = Vec::new();
+    if s.is_empty() { return out; }
+    if max_w == 0 {
+        out.push((0..s.len(), s.to_string()));
+        return out;
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut line_start = 0usize;
+    let mut col = 0usize;
+    let mut last_break: Option<usize> = None; // byte just after the most recent whitespace
+    let mut ci = 0usize;
+    while ci < chars.len() {
+        let (idx, ch) = chars[ci];
+        let w = ch.width().unwrap_or(0);
+        if col + w > max_w && col > 0 {
+            // Wrap. Prefer the most recent whitespace boundary; if there
+            // wasn't one inside the current line, hard-break at `idx`.
+            let break_at = last_break.filter(|&b| b > line_start).unwrap_or(idx);
+            let text = s[line_start..break_at].trim_end_matches(|c: char| c.is_whitespace()).to_string();
+            out.push((line_start..break_at, text));
+            line_start = break_at;
+            col = 0;
+            last_break = None;
+            // Re-evaluate this char on the new line.
+            continue;
+        }
+        if ch.is_whitespace() {
+            last_break = Some(idx + ch.len_utf8());
+        }
+        col += w;
+        ci += 1;
+    }
+    if line_start < s.len() {
+        out.push((line_start..s.len(), s[line_start..].to_string()));
+    } else if out.is_empty() {
+        out.push((0..0, String::new()));
+    }
+    out
 }
 
 /// Try to find an inline element in `runs` whose range contains `cursor`,
@@ -747,27 +798,44 @@ fn substitute_inline_at_cursor(
 /// of the block under the cursor with its underlying markdown text. We use
 /// the muted text color (no code background) so it visually distinguishes
 /// from real code blocks.
-fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, theme: &Theme) -> Block {
+fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, width: usize, theme: &Theme) -> Block {
     let slice = source.get(range.clone()).unwrap_or("");
     let style = Style::default().fg(theme.muted);
     let cursor_in_block = cursor.saturating_sub(range.start);
+    // Pre block adds a 2-col left pad in layout, so the inner usable width
+    // is `width - 2`. Clamp to ≥1 so we always make progress.
+    let inner_width = width.saturating_sub(2).max(1);
 
     let mut lines: Vec<Vec<Run>> = Vec::new();
     let mut byte_idx = 0usize;
     for line in slice.split('\n') {
         let line_len = line.len();
-        let s = line.strip_suffix('\r').unwrap_or(line).to_string();
-        let cursor_at = if cursor_in_block >= byte_idx && cursor_in_block <= byte_idx + line_len {
-            // Trim CR off the byte position too so cursor doesn't land on
-            // a stripped char.
-            Some((cursor_in_block - byte_idx).min(s.len()))
+        let stripped = line.strip_suffix('\r').unwrap_or(line);
+        // Wrap this single source line to `inner_width` display columns.
+        // Each wrapped chunk records its byte range within `stripped` so
+        // cursor_at can be placed on the right chunk.
+        let chunks = wrap_to_width(stripped, inner_width);
+        let chunks: Vec<(std::ops::Range<usize>, String)> = if chunks.is_empty() {
+            vec![(0..0, String::new())]
         } else {
-            None
+            chunks
         };
-        if s.is_empty() && cursor_at.is_none() {
-            lines.push(Vec::new());
-        } else {
-            lines.push(vec![Run { text: s, style, link: None, checkbox: None, image: None, inline_range: None, cursor_at }]);
+        for (chunk_range, chunk_text) in chunks {
+            // chunk byte offsets are relative to `stripped`, which equals
+            // the source line minus an optional trailing `\r`. cursor_in_block
+            // counts from the start of the source range, so add byte_idx.
+            let chunk_block_start = byte_idx + chunk_range.start;
+            let chunk_block_end = byte_idx + chunk_range.end;
+            let cursor_at = if cursor_in_block >= chunk_block_start && cursor_in_block <= chunk_block_end {
+                Some(cursor_in_block - chunk_block_start)
+            } else {
+                None
+            };
+            if chunk_text.is_empty() && cursor_at.is_none() {
+                lines.push(Vec::new());
+            } else {
+                lines.push(vec![Run { text: chunk_text, style, link: None, checkbox: None, image: None, inline_range: None, cursor_at }]);
+            }
         }
         byte_idx += line_len + 1; // consumed `\n`
     }
