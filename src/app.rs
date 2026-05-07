@@ -65,6 +65,10 @@ pub struct App {
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
+    /// Git lens overlay state. `Some` while the user has Ctrl-G toggled on.
+    /// Holds the parsed diff vs HEAD (staged + unstaged combined) for the
+    /// current file. `None` otherwise.
+    pub git_lens: Option<GitLensState>,
     /// Most recent left-mouse-down (Instant + column + row), used to detect
     /// double-clicks for word selection.
     pub last_click: Option<(std::time::Instant, u16, u16)>,
@@ -133,6 +137,55 @@ pub struct EditState {
     /// Any other key clears it. Stored as a flag (not a timestamp) so the
     /// statusline confirm prompt persists until the user makes a choice.
     pub discard_pending: bool,
+    /// Undo stack: prior (raw, cursor) snapshots. Pushed before each
+    /// mutating op; Ctrl-Z pops to revert.
+    pub undo: Vec<EditSnapshot>,
+    /// Redo stack: snapshots popped from undo after a Ctrl-Z. Cleared on
+    /// any new mutation (since the future timeline diverged).
+    pub redo: Vec<EditSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditSnapshot {
+    pub raw: String,
+    pub cursor: usize,
+}
+
+/// Soft cap on undo depth. Picked to balance memory (each snapshot is one
+/// String clone) against typical editing sessions.
+pub const UNDO_LIMIT: usize = 200;
+
+/// Pre-parsed `git diff HEAD -- <file>` content. Each entry is a single
+/// display row tagged with how it should be styled. We deliberately keep
+/// the parser tiny and tolerant — the goal is a quick visual lens, not a
+/// fully-correct diff parser.
+#[derive(Clone, Debug)]
+pub struct GitLensState {
+    pub rows: Vec<DiffRow>,
+    /// Scroll offset within the diff overlay.
+    pub scroll: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffRow {
+    pub kind: DiffRowKind,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffRowKind {
+    /// Context line (unchanged) — rendered plain.
+    Context,
+    /// Added line — green background.
+    Added,
+    /// Removed line — red background.
+    Removed,
+    /// Hunk header (`@@ -a,b +c,d @@`) — muted fg.
+    Hunk,
+    /// File header (`diff --git`, `index`, `---`, `+++`) — muted, dim.
+    Header,
+    /// Synthetic informational row (e.g. "no changes") — muted bold.
+    Info,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +290,7 @@ impl App {
             last_mouse_col: 0,
             last_mouse_row: 0,
             mouse_enabled: true,
+            git_lens: None,
             last_click: None,
             scroll_accum: 0.0,
             last_scroll_at: None,
@@ -535,6 +589,65 @@ impl App {
         r.scroll = new.min(max_scroll) as u16;
     }
 
+    /// Toggle the git lens overlay. On the way in, runs `git diff HEAD --`
+    /// for the current reader file (combined staged + unstaged); on the way
+    /// out, just drops the cached diff. No-op for stdin or non-Reader views.
+    /// Disabled in edit mode (the diff would race with un-saved buffer).
+    pub fn toggle_git_lens(&mut self) {
+        if let View::Reader(r) = &self.view {
+            if r.edit.is_some() {
+                self.status = "Git lens unavailable while editing".into();
+                return;
+            }
+        }
+        if self.git_lens.is_some() {
+            self.git_lens = None;
+            self.status.clear();
+            return;
+        }
+        let path = match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::File(p) => p.clone(),
+                ReaderOrigin::Stdin => {
+                    self.status = "Git lens unavailable for stdin".into();
+                    return;
+                }
+            },
+            _ => return,
+        };
+        match run_git_diff(&path) {
+            Ok(diff) => {
+                let rows = parse_unified_diff(&diff);
+                let clean = rows.iter().all(|r| matches!(r.kind, DiffRowKind::Header | DiffRowKind::Info));
+                let rows = if clean {
+                    vec![DiffRow {
+                        kind: DiffRowKind::Info,
+                        text: "✓ No uncommitted changes".to_string(),
+                    }]
+                } else {
+                    rows
+                };
+                let _ = clean;
+                self.git_lens = Some(GitLensState { rows, scroll: 0 });
+            }
+            Err(e) => {
+                self.status = format!("git diff: {}", e);
+            }
+        }
+    }
+
+    /// Scroll the git lens overlay by `delta` rows (clamped). No-op if the
+    /// overlay isn't open.
+    pub fn git_lens_scroll(&mut self, delta: i32) {
+        let h = self.viewport.height as i32;
+        if let Some(g) = self.git_lens.as_mut() {
+            let total = g.rows.len() as i32;
+            let max = (total - h).max(0);
+            let new = (g.scroll as i32 + delta).clamp(0, max) as u16;
+            g.scroll = new;
+        }
+    }
+
     /// Enter in-house edit mode. Cursor starts at byte 0; nothing dirty;
     /// no discard pending. No-op for stdin (we'd have nothing to write to).
     pub fn enter_edit(&mut self) {
@@ -543,7 +656,13 @@ impl App {
                 self.status = "Cannot edit: source is stdin".into();
                 return;
             }
-            r.edit = Some(EditState { cursor: 0, dirty: false, discard_pending: false });
+            r.edit = Some(EditState {
+                cursor: 0,
+                dirty: false,
+                discard_pending: false,
+                undo: Vec::new(),
+                redo: Vec::new(),
+            });
             r.rendered = None;
             self.status.clear();
         }
@@ -580,11 +699,14 @@ impl App {
     /// it. Marks dirty. No-op outside edit mode.
     pub fn edit_insert(&mut self, text: &str) {
         let View::Reader(r) = &mut self.view else { return };
-        let Some(e) = r.edit.as_mut() else { return };
+        if r.edit.is_none() { return; }
+        push_undo(r);
+        let e = r.edit.as_mut().unwrap();
         let pos = e.cursor.min(r.raw.len());
         // Snap to the nearest char boundary <= pos so we don't mid-byte split.
         let pos = floor_char_boundary(&r.raw, pos);
         r.raw.insert_str(pos, text);
+        let e = r.edit.as_mut().unwrap();
         e.cursor = pos + text.len();
         e.dirty = true;
         e.discard_pending = false;
@@ -595,11 +717,14 @@ impl App {
     /// the cursor is at byte 0.
     pub fn edit_backspace(&mut self) {
         let View::Reader(r) = &mut self.view else { return };
-        let Some(e) = r.edit.as_mut() else { return };
+        let Some(e) = r.edit.as_ref() else { return };
         if e.cursor == 0 { return; }
+        push_undo(r);
+        let e = r.edit.as_mut().unwrap();
         let end = floor_char_boundary(&r.raw, e.cursor);
         let prev = prev_char_boundary(&r.raw, end);
         r.raw.replace_range(prev..end, "");
+        let e = r.edit.as_mut().unwrap();
         e.cursor = prev;
         e.dirty = true;
         e.discard_pending = false;
@@ -609,11 +734,52 @@ impl App {
     /// Delete one char to the right of the cursor (Delete key).
     pub fn edit_delete(&mut self) {
         let View::Reader(r) = &mut self.view else { return };
-        let Some(e) = r.edit.as_mut() else { return };
+        if r.edit.is_none() { return; }
+        let e = r.edit.as_ref().unwrap();
         let pos = floor_char_boundary(&r.raw, e.cursor);
         if pos >= r.raw.len() { return; }
+        push_undo(r);
         let next = next_char_boundary(&r.raw, pos);
         r.raw.replace_range(pos..next, "");
+        let e = r.edit.as_mut().unwrap();
+        e.dirty = true;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
+    /// Undo the last edit. Pops a snapshot off the undo stack, pushes the
+    /// current state to redo, and restores raw + cursor.
+    pub fn edit_undo(&mut self) {
+        let View::Reader(r) = &mut self.view else { return };
+        if r.edit.is_none() { return; }
+        let e = r.edit.as_mut().unwrap();
+        let Some(snap) = e.undo.pop() else { return };
+        // Save current as redo entry.
+        let cur_cursor = e.cursor;
+        let cur_raw = std::mem::take(&mut r.raw);
+        // Restore.
+        r.raw = snap.raw;
+        let e = r.edit.as_mut().unwrap();
+        e.redo.push(EditSnapshot { raw: cur_raw, cursor: cur_cursor });
+        e.cursor = snap.cursor.min(r.raw.len());
+        e.dirty = true; // Even after undo, the buffer differs from disk usually.
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
+    /// Redo a previously undone edit.
+    pub fn edit_redo(&mut self) {
+        let View::Reader(r) = &mut self.view else { return };
+        if r.edit.is_none() { return; }
+        let e = r.edit.as_mut().unwrap();
+        let Some(snap) = e.redo.pop() else { return };
+        let cur_cursor = e.cursor;
+        let cur_raw = std::mem::take(&mut r.raw);
+        r.raw = snap.raw;
+        let e = r.edit.as_mut().unwrap();
+        e.undo.push(EditSnapshot { raw: cur_raw, cursor: cur_cursor });
+        if e.undo.len() > UNDO_LIMIT { e.undo.remove(0); }
+        e.cursor = snap.cursor.min(r.raw.len());
         e.dirty = true;
         e.discard_pending = false;
         r.rendered = None;
@@ -930,6 +1096,68 @@ impl Reader {
             last_meta: None,
         }
     }
+}
+
+/// Run `git diff HEAD -- <path>` (which combines staged + unstaged changes
+/// against the last commit) and return the raw output. Errors surface as
+/// strings so the statusline can show them.
+fn run_git_diff(path: &Path) -> std::result::Result<String, String> {
+    use std::process::Command;
+    // Run from the file's directory so `git` finds the right repo.
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-pager")
+        .arg("diff")
+        .arg("--no-color")
+        .arg("HEAD")
+        .arg("--")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn: {}", e))?;
+    if !output.status.success() {
+        // `git diff` returns 0 with no output when there are no changes.
+        // A non-zero exit means a real failure (not in a repo, etc.).
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() { format!("exit {}", output.status) } else { err });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parse a unified diff into typed rows. The parser is deliberately small:
+/// line-prefix dispatch, no detection of binary diffs / mode changes /
+/// rename headers beyond bucketing them as `Header`. That's plenty for a
+/// quick visual lens.
+fn parse_unified_diff(diff: &str) -> Vec<DiffRow> {
+    let mut out = Vec::with_capacity(diff.lines().count());
+    for line in diff.lines() {
+        let kind = if line.starts_with("@@") {
+            DiffRowKind::Hunk
+        } else if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") || line.starts_with("new file") || line.starts_with("deleted file") || line.starts_with("rename ") || line.starts_with("similarity ") {
+            DiffRowKind::Header
+        } else if line.starts_with('+') {
+            DiffRowKind::Added
+        } else if line.starts_with('-') {
+            DiffRowKind::Removed
+        } else {
+            DiffRowKind::Context
+        };
+        out.push(DiffRow { kind, text: line.to_string() });
+    }
+    out
+}
+
+/// Snapshot the current (raw, cursor) into the reader's undo stack.
+/// Clears the redo stack since a new mutation diverges the timeline.
+/// Caps the undo stack at `UNDO_LIMIT` entries (FIFO eviction).
+fn push_undo(r: &mut Reader) {
+    let Some(e) = r.edit.as_mut() else { return };
+    e.undo.push(EditSnapshot { raw: r.raw.clone(), cursor: e.cursor });
+    if e.undo.len() > UNDO_LIMIT {
+        e.undo.remove(0);
+    }
+    e.redo.clear();
 }
 
 /// Snap `pos` down to the nearest UTF-8 char boundary <= pos.
@@ -1534,6 +1762,83 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undo_restores_prior_buffer_and_cursor() {
+        let dir = fresh_temp("edit-undo");
+        let path = dir.join("u.md");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        // Insert two distinct edits; undo once → first edit remains; undo
+        // twice → buffer back to original.
+        app.edit_insert("X");
+        app.edit_insert("Y");
+        match &app.view { View::Reader(r) => assert_eq!(r.raw, "XYabc\n"), _ => panic!() };
+        app.edit_undo();
+        match &app.view { View::Reader(r) => assert_eq!(r.raw, "Xabc\n"), _ => panic!() };
+        app.edit_undo();
+        match &app.view { View::Reader(r) => assert_eq!(r.raw, "abc\n"), _ => panic!() };
+        // Redo once → first edit reapplied.
+        app.edit_redo();
+        match &app.view { View::Reader(r) => assert_eq!(r.raw, "Xabc\n"), _ => panic!() };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn redo_stack_clears_on_new_mutation() {
+        let dir = fresh_temp("edit-redo-clear");
+        let path = dir.join("r.md");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        app.edit_insert("X");
+        app.edit_undo(); // redo stack now has the X-insert
+        app.edit_insert("Y"); // diverging mutation — should drop the redo
+        match &app.view {
+            View::Reader(r) => {
+                assert_eq!(r.raw, "Ya\n");
+                let e = r.edit.as_ref().unwrap();
+                assert!(e.redo.is_empty(), "redo should be cleared after diverging edit");
+            }
+            _ => panic!(),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_unified_diff_classifies_row_kinds() {
+        let diff = "\
+diff --git a/x.md b/x.md\n\
+index abc..def 100644\n\
+--- a/x.md\n\
++++ b/x.md\n\
+@@ -1,3 +1,4 @@\n\
+ context line\n\
+-removed\n\
++added\n\
++another added\n\
+ trailer\n";
+        let rows = parse_unified_diff(diff);
+        let kinds: Vec<DiffRowKind> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DiffRowKind::Header,
+                DiffRowKind::Header,
+                DiffRowKind::Header,
+                DiffRowKind::Header,
+                DiffRowKind::Hunk,
+                DiffRowKind::Context,
+                DiffRowKind::Removed,
+                DiffRowKind::Added,
+                DiffRowKind::Added,
+                DiffRowKind::Context,
+            ],
+        );
     }
 
     #[test]

@@ -59,6 +59,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         return Ok(());
     }
+    // Ctrl-G toggles the git lens overlay (works in both view and edit
+    // modes — but `toggle_git_lens` itself refuses while editing).
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_git_lens();
+        return Ok(());
+    }
+    // Git lens captures j/k/PgUp/PgDn for scrolling within the diff, plus
+    // Esc/q to dismiss. Anything else falls through to the normal handler
+    // so the user can e.g. press `?` for help while the lens is open.
+    if app.git_lens.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => { app.git_lens = None; return Ok(()); }
+            KeyCode::Char('j') | KeyCode::Down => { app.git_lens_scroll(1); return Ok(()); }
+            KeyCode::Char('k') | KeyCode::Up => { app.git_lens_scroll(-1); return Ok(()); }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                let h = app.viewport.height as i32;
+                app.git_lens_scroll(h.max(1));
+                return Ok(());
+            }
+            KeyCode::PageUp => {
+                let h = app.viewport.height as i32;
+                app.git_lens_scroll(-h.max(1));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if app.search.is_some() {
         return handle_search_key(app, key);
     }
@@ -309,6 +336,18 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // XOFF / flow control).
     if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('w')) {
         app.save_edit()?;
+        return Ok(());
+    }
+
+    // Undo / redo. Ctrl-Y is the more common second binding alongside the
+    // canonical Ctrl-Z; Ctrl-Shift-Z would be cleaner but most terminals
+    // can't disambiguate it from plain Ctrl-Z.
+    if ctrl && matches!(key.code, KeyCode::Char('z')) {
+        app.edit_undo();
+        return Ok(());
+    }
+    if ctrl && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('r')) {
+        app.edit_redo();
         return Ok(());
     }
 

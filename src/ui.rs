@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{self, App, BrowserEntryKind, Focus, View};
+use crate::app::{self, App, BrowserEntryKind, DiffRowKind, Focus, View};
 use crate::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -66,12 +66,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // stable whether or not content overflows. Browser ignores this width.
     app.ensure_rendered(body.width.saturating_sub(1));
 
-    match &app.view {
-        View::Reader(_) => draw_reader(f, app, body),
-        View::Browser(_) => draw_browser(f, app, body),
-    }
-    if matches!(app.view, View::Reader(_)) {
-        draw_images_overlay(f, app, body);
+    if app.git_lens.is_some() && matches!(app.view, View::Reader(_)) {
+        draw_git_lens(f, app, body);
+    } else {
+        match &app.view {
+            View::Reader(_) => draw_reader(f, app, body),
+            View::Browser(_) => draw_browser(f, app, body),
+        }
+        if matches!(app.view, View::Reader(_)) {
+            draw_images_overlay(f, app, body);
+        }
     }
 
     draw_statusline(f, app, status);
@@ -209,6 +213,44 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
+}
+
+/// Render the git lens overlay: each diff row is one display line, with
+/// added rows on a green background, removed on red, hunk headers muted.
+/// The viewport scrolls via `git_lens.scroll`.
+fn draw_git_lens(f: &mut Frame, app: &App, area: Rect) {
+    use ratatui::style::Color;
+    let Some(g) = app.git_lens.as_ref() else { return; };
+    let theme = &app.opts.theme;
+    let added_bg = Color::Rgb(0x2d, 0x4f, 0x2d);
+    let removed_bg = Color::Rgb(0x5a, 0x2d, 0x2d);
+    let visible_h = area.height as usize;
+    let scroll = (g.scroll as usize).min(g.rows.len().saturating_sub(1));
+
+    let mut display_lines: Vec<Line> = Vec::with_capacity(visible_h);
+    for i in 0..visible_h {
+        let idx = scroll + i;
+        if idx >= g.rows.len() { break; }
+        let row = &g.rows[idx];
+        let style = match row.kind {
+            DiffRowKind::Added => Style::default().bg(added_bg),
+            DiffRowKind::Removed => Style::default().bg(removed_bg),
+            DiffRowKind::Hunk => Style::default().fg(theme.heading[0]).add_modifier(Modifier::BOLD),
+            DiffRowKind::Header => Style::default().fg(theme.muted),
+            DiffRowKind::Info => Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+            DiffRowKind::Context => Style::default(),
+        };
+        // Pad rows to full width so the bg color extends the whole line.
+        let visible_w = unicode_width::UnicodeWidthStr::width(row.text.as_str());
+        let pad = (area.width as usize).saturating_sub(visible_w);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(row.text.clone(), style));
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), style));
+        }
+        display_lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(display_lines), area);
 }
 
 /// Render any visible images in the document on top of the body, using the
@@ -561,6 +603,18 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         None
     };
+    let lens_badge: Option<Span> = if app.git_lens.is_some() {
+        Some(Span::styled(
+            " GIT LENS ".to_string(),
+            Style::default()
+                .bg(theme.heading[1])
+                .fg(theme.status_fg)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        None
+    };
+    let edit_badge = edit_badge.or(lens_badge);
     if edit_badge.is_none() && !app.history.is_empty() {
         let label = " ‹ Back ";
         let start_x = area.x;
@@ -669,10 +723,13 @@ fn compute_middle(app: &App) -> Mid {
     if !app.status.is_empty() {
         return Mid::Status(app.status.clone());
     }
+    if app.git_lens.is_some() {
+        return Mid::Hint("git lens (vs HEAD)  j/k scroll  Ctrl-G or Esc to dismiss".into());
+    }
     if let View::Reader(r) = &app.view {
         // Edit-mode hint replaces the normal viewer hint when active.
         if r.edit.is_some() {
-            return Mid::Hint("type to edit  Ctrl-S save  Esc Esc discard".into());
+            return Mid::Hint("type to edit  Ctrl-S save  Ctrl-Z undo  Esc Esc discard".into());
         }
         if let Some(s) = r.doc_search.as_ref() {
             let txt = if s.editing {
@@ -798,6 +855,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  l / f            history forward"),
         Line::from("  e                enter in-house edit mode"),
         Line::from("                   (Ctrl-S save, Ctrl-W save backup, Esc Esc discard)"),
+        Line::from("                   Ctrl-Z undo, Ctrl-Y/Ctrl-R redo"),
+        Line::from("  Ctrl-G            git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  o                open focused link in browser"),
         Line::from("  m                toggle mouse capture (drag-to-select)"),
         Line::from("  q / Ctrl-C       quit"),

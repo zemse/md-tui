@@ -83,7 +83,7 @@ pub fn render_with_edit(
     b.finish()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Run {
     text: String,
     style: Style,
@@ -94,6 +94,16 @@ struct Run {
     /// Index into `images` if this run is an image placeholder. Recorded so
     /// the layout pass can map (image idx → output line) for later rendering.
     image: Option<usize>,
+    /// Source byte range of the *innermost* inline element this run is part
+    /// of (Strong/Emphasis/Strikethrough/Link/Image/Code). Edit mode uses
+    /// this to find the smallest enclosing element to swap for raw source.
+    /// `None` for plain paragraph/heading text not wrapped in inline syntax.
+    inline_range: Option<std::ops::Range<usize>>,
+    /// When `Some(byte_offset)`, the cursor sits at this byte position within
+    /// `text`. Set by the edit-mode substitution pass on the synthetic raw
+    /// run; the layout pass watches for it and records the resulting display
+    /// (col, line) in `Rendered::cursor_xy`.
+    cursor_at: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +169,11 @@ struct Builder {
     // link state
     open_link: Option<usize>,
 
+    // Innermost-first stack of inline-element source ranges. Push on
+    // Tag::Strong/Emphasis/Strikethrough/Link/Image; pop on End. The top of
+    // stack tags every Run created while inside via `Run::inline_range`.
+    inline_range_stack: Vec<std::ops::Range<usize>>,
+
     // table state
     table: Option<TableState>,
 }
@@ -211,8 +226,13 @@ impl Builder {
             code_content: String::new(),
             in_code_block: false,
             open_link: None,
+            inline_range_stack: Vec::new(),
             table: None,
         }
+    }
+
+    fn cur_inline_range(&self) -> Option<std::ops::Range<usize>> {
+        self.inline_range_stack.last().cloned()
     }
 
     fn cur_style(&self) -> Style {
@@ -238,7 +258,7 @@ impl Builder {
             style: Style::default().fg(self.theme.quote),
             link: None,
             checkbox: None,
-            image: None,
+            image: None, inline_range: None, cursor_at: None
         }]
     }
 
@@ -258,15 +278,15 @@ impl Builder {
         let pad = " ".repeat(marker.chars().count());
         let style = Style::default().fg(self.theme.list_marker);
         let prefix = vec![
-            Run { text: indent.clone(), style: Style::default(), link: None, checkbox: None, image: None },
-            Run { text: marker, style, link: None, checkbox: None, image: None },
+            Run { text: indent.clone(), style: Style::default(), link: None, checkbox: None, image: None , inline_range: None, cursor_at: None},
+            Run { text: marker, style, link: None, checkbox: None, image: None , inline_range: None, cursor_at: None},
         ];
         let hanging = vec![Run {
             text: format!("{}{}", indent, pad),
             style: Style::default(),
             link: None,
             checkbox: None,
-            image: None,
+            image: None, inline_range: None, cursor_at: None
         }];
         (prefix, hanging)
     }
@@ -302,18 +322,21 @@ impl Builder {
             self.heading_buf.push_str(text);
         }
         let style = self.cur_style();
+        let inline_range = self.cur_inline_range();
         self.cur_runs.push(Run {
             text: text.to_string(),
             style,
             link: self.open_link,
             checkbox: None,
             image: None,
+            inline_range,
+            cursor_at: None,
         });
     }
 
     fn event(&mut self, ev: Event<'_>, range: std::ops::Range<usize>) {
         match ev {
-            Event::Start(tag) => self.start_tag(tag),
+            Event::Start(tag) => self.start_tag(tag, range.clone()),
             Event::End(tag) => self.end_tag(tag, range.clone()),
             Event::Text(s) => self.push_text(&s),
             Event::Code(s) => {
@@ -321,12 +344,17 @@ impl Builder {
                     .cur_style()
                     .fg(self.theme.code_fg)
                     .bg_opt(self.theme.code_bg);
+                // Inline `code` is its own element — record the full source
+                // range (including backticks) so edit mode can substitute
+                // back to `\`code\`` raw.
                 self.cur_runs.push(Run {
                     text: format!(" {} ", s),
                     style,
                     link: self.open_link,
                     checkbox: None,
                     image: None,
+                    inline_range: Some(range.clone()),
+                    cursor_at: None,
                 });
                 if self.in_heading.is_some() {
                     self.heading_buf.push_str(&s);
@@ -340,7 +368,7 @@ impl Builder {
                     style,
                     link: self.open_link,
                     checkbox: None,
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
             }
             Event::SoftBreak => {
@@ -349,7 +377,7 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
             }
             Event::HardBreak => {
@@ -358,7 +386,7 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
             }
             Event::Rule => self.push_block(Block::Rule, range.clone()),
@@ -377,21 +405,21 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: Some(cb_idx),
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
                 self.cur_runs.push(Run {
                     text: " ".to_string(),
                     style: Style::default(),
                     link: None,
                     checkbox: None,
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
             }
             _ => {}
         }
     }
 
-    fn start_tag(&mut self, tag: Tag<'_>) {
+    fn start_tag(&mut self, tag: Tag<'_>, range: std::ops::Range<usize>) {
         match tag {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
@@ -428,14 +456,17 @@ impl Builder {
             Tag::Emphasis => {
                 let m = self.theme.emphasis;
                 self.push_style(|s| s.add_modifier(m));
+                self.inline_range_stack.push(range.clone());
             }
             Tag::Strong => {
                 let m = self.theme.strong;
                 self.push_style(|s| s.add_modifier(m));
+                self.inline_range_stack.push(range.clone());
             }
             Tag::Strikethrough => {
                 let m = self.theme.strikethrough;
                 self.push_style(|s| s.add_modifier(m));
+                self.inline_range_stack.push(range.clone());
             }
             Tag::Link { dest_url, .. } => {
                 let target = links::resolve(&dest_url, self.base_dir.as_deref());
@@ -446,6 +477,7 @@ impl Builder {
                     .fg(self.theme.link)
                     .add_modifier(self.theme.link_modifier);
                 self.style_stack.push(style);
+                self.inline_range_stack.push(range.clone());
             }
             Tag::Image { dest_url, title, .. } => {
                 let style = Style::default().fg(self.theme.muted);
@@ -466,7 +498,7 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: None,
-                    image: Some(img_idx),
+                    image: Some(img_idx), inline_range: None, cursor_at: None
                 });
             }
             Tag::Table(aligns) => {
@@ -491,7 +523,7 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: None,
-                    image: None,
+                    image: None, inline_range: None, cursor_at: None
                 });
             }
             _ => {}
@@ -541,7 +573,7 @@ impl Builder {
                                 style: sp.style,
                                 link: None,
                                 checkbox: None,
-                                image: None,
+                                image: None, inline_range: None, cursor_at: None
                             })
                             .collect()
                     })
@@ -562,10 +594,12 @@ impl Builder {
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.pop_style();
+                self.inline_range_stack.pop();
             }
             TagEnd::Link => {
                 self.style_stack.pop();
                 self.open_link = None;
+                self.inline_range_stack.pop();
             }
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
@@ -607,13 +641,35 @@ impl Builder {
         // cursor will only land in committed blocks via the `blocks` list.
         let pseudo = 0..self.source.len();
         self.finish_paragraph(pseudo);
-        // Apply block-level raw substitution if the cursor is inside any
-        // committed block. This is the MVP edit-mode "live preview" toggle.
+
+        // Edit-mode live-preview toggle:
+        // - For Paragraph blocks where the cursor falls inside an inline
+        //   element (Strong/Emphasis/Strike/Link/Image/Code), replace just
+        //   that element's runs with a single raw Run carrying cursor_at.
+        // - For everything else (heading, code fence, list item, table,
+        //   block-quote, AND paragraphs whose cursor sits in plain text
+        //   between inline elements), fall back to whole-block raw via
+        //   make_raw_block so the cursor is always rendered on a raw line.
         if let Some(ctx) = self.edit {
+            let cursor = ctx.cursor;
             for entry in &mut self.blocks {
                 if entry.source_range.is_empty() { continue; }
-                if entry.source_range.start <= ctx.cursor && ctx.cursor < entry.source_range.end {
-                    entry.block = make_raw_block(&self.source, &entry.source_range, &self.theme);
+                if !(entry.source_range.start <= cursor && cursor <= entry.source_range.end) {
+                    continue;
+                }
+                let did_inline = match &mut entry.block {
+                    Block::Paragraph { runs, .. } => {
+                        substitute_inline_at_cursor(runs, &self.source, cursor, &self.theme)
+                    }
+                    _ => false,
+                };
+                if !did_inline {
+                    entry.block = make_raw_block(
+                        &self.source,
+                        &entry.source_range,
+                        cursor,
+                        &self.theme,
+                    );
                 }
             }
         }
@@ -630,27 +686,91 @@ impl Builder {
     }
 }
 
+/// Try to find an inline element in `runs` whose range contains `cursor`,
+/// and substitute its runs with a single raw Run carrying cursor_at.
+/// Returns true if a substitution was made.
+fn substitute_inline_at_cursor(
+    runs: &mut Vec<Run>,
+    source: &str,
+    cursor: usize,
+    theme: &Theme,
+) -> bool {
+    // Find the *smallest* (innermost) inline element containing cursor.
+    // Each run records its innermost inline_range so the smallest range
+    // touching the cursor wins.
+    let mut best: Option<std::ops::Range<usize>> = None;
+    for r in runs.iter() {
+        if let Some(rng) = &r.inline_range {
+            if rng.start <= cursor && cursor <= rng.end {
+                let take = match &best {
+                    None => true,
+                    Some(b) => (rng.end - rng.start) < (b.end - b.start),
+                };
+                if take { best = Some(rng.clone()); }
+            }
+        }
+    }
+    let elem = match best { Some(r) => r, None => return false };
+
+    // Find the contiguous slice of runs whose inline_range matches `elem`.
+    // (Innermost-only tracking means matching ranges are contiguous within
+    // a paragraph.)
+    let first = runs.iter().position(|r| r.inline_range.as_ref() == Some(&elem));
+    let first = match first { Some(i) => i, None => return false };
+    let mut last = first;
+    while last + 1 < runs.len()
+        && runs[last + 1].inline_range.as_ref() == Some(&elem)
+    {
+        last += 1;
+    }
+
+    let raw = source.get(elem.clone()).unwrap_or("").to_string();
+    let cursor_at = cursor.saturating_sub(elem.start).min(raw.len());
+    let style = Style::default()
+        .fg(theme.muted)
+        .bg_opt(theme.code_bg);
+    let synthetic = Run {
+        text: raw,
+        style,
+        link: None,
+        checkbox: None,
+        image: None,
+        inline_range: Some(elem),
+        cursor_at: Some(cursor_at),
+    };
+    runs.splice(first..=last, std::iter::once(synthetic));
+    true
+}
+
 /// Take a source byte range and produce a `Pre`-like block whose content is
 /// the raw source slice. Used by edit mode to replace the formatted display
 /// of the block under the cursor with its underlying markdown text. We use
 /// the muted text color (no code background) so it visually distinguishes
 /// from real code blocks.
-fn make_raw_block(source: &str, range: &std::ops::Range<usize>, theme: &Theme) -> Block {
+fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, theme: &Theme) -> Block {
     let slice = source.get(range.clone()).unwrap_or("");
     let style = Style::default().fg(theme.muted);
-    let lines: Vec<Vec<Run>> = slice
-        .split('\n')
-        .map(|line| {
-            // Strip a single trailing CR so DOS line endings don't leave a
-            // visible glyph at the right edge.
-            let s = line.strip_suffix('\r').unwrap_or(line).to_string();
-            if s.is_empty() {
-                Vec::new()
-            } else {
-                vec![Run { text: s, style, link: None, checkbox: None, image: None }]
-            }
-        })
-        .collect();
+    let cursor_in_block = cursor.saturating_sub(range.start);
+
+    let mut lines: Vec<Vec<Run>> = Vec::new();
+    let mut byte_idx = 0usize;
+    for line in slice.split('\n') {
+        let line_len = line.len();
+        let s = line.strip_suffix('\r').unwrap_or(line).to_string();
+        let cursor_at = if cursor_in_block >= byte_idx && cursor_in_block <= byte_idx + line_len {
+            // Trim CR off the byte position too so cursor doesn't land on
+            // a stripped char.
+            Some((cursor_in_block - byte_idx).min(s.len()))
+        } else {
+            None
+        };
+        if s.is_empty() && cursor_at.is_none() {
+            lines.push(Vec::new());
+        } else {
+            lines.push(vec![Run { text: s, style, link: None, checkbox: None, image: None, inline_range: None, cursor_at }]);
+        }
+        byte_idx += line_len + 1; // consumed `\n`
+    }
     // Render with no left-pad / quote-bar prefix so the raw text aligns to
     // column 0 — that lets the cursor display position math match the
     // source-line column directly.
@@ -688,6 +808,7 @@ fn layout(
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
     let mut block_infos: Vec<BlockInfo> = Vec::new();
+    let mut cursor_xy: Option<(u16, u16)> = None;
 
     // For each link index, track the open span being built across runs.
     let mut open_spans: Vec<Option<OpenSpan>> = (0..links.len()).map(|_| None).collect();
@@ -726,6 +847,7 @@ fn layout(
                     &mut out_checkboxes,
                     &checkboxes,
                     &mut image_lines,
+                    &mut cursor_xy,
                 );
             }
             Block::Paragraph { runs, prefix, hanging } => {
@@ -741,6 +863,7 @@ fn layout(
                     &mut out_checkboxes,
                     &checkboxes,
                     &mut image_lines,
+                    &mut cursor_xy,
                 );
             }
             Block::Table { alignments, header, rows } => {
@@ -751,6 +874,7 @@ fn layout(
                 let prefix_width = prefix.iter().map(|r| r.text.width()).sum::<usize>() + pad_left.width();
                 let bg = theme.code_bg;
                 for line_runs in lines {
+                    let line_y = out_lines.len() as u16;
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     for r in &prefix {
                         spans.push(Span::styled(r.text.clone(), r.style));
@@ -759,10 +883,21 @@ fn layout(
                         pad_left.to_string(),
                         Style::default().bg_opt(bg),
                     ));
-                    let mut content_w = 0;
+                    let mut content_w = 0usize;
+                    let mut col_offset = prefix_width as u16;
                     for r in line_runs {
+                        // Cursor lookup: if this run carries cursor_at, the
+                        // display column is prefix + content-so-far + width
+                        // of the run prefix up to cursor_at bytes.
+                        if let Some(c) = r.cursor_at {
+                            let pre = r.text.get(..c.min(r.text.len())).unwrap_or("");
+                            let cursor_col = col_offset + pre.width() as u16;
+                            cursor_xy = Some((cursor_col, line_y));
+                        }
                         let s = r.style.bg_opt(bg);
-                        content_w += r.text.width();
+                        let w = r.text.width();
+                        content_w += w;
+                        col_offset += w as u16;
                         spans.push(Span::styled(r.text, s));
                     }
                     let pad_right = width.saturating_sub(prefix_width + content_w);
@@ -786,9 +921,11 @@ fn layout(
         }
     }
 
-    // Compute cursor display position for edit mode. Map source byte offset
-    // to a (line, col) in the rendered output by walking the block list.
-    let cursor_xy = edit.and_then(|ctx| cursor_to_xy(&block_infos, &source, &out_lines, ctx.cursor));
+    // The cursor display position is recorded directly by the layout pass
+    // when emitting a Run with `cursor_at` set. Edit mode produces such a
+    // Run (either via inline-element substitution or block-level raw fall-
+    // back); view mode never does.
+    let _ = (&source, &edit);
 
     let link_map = LinkMap {
         links: out_links,
@@ -809,47 +946,6 @@ fn layout(
         blocks: block_infos,
         cursor_xy,
     }
-}
-
-/// Map a source byte offset to a display (line, col) coordinate. Relies on
-/// the cursor sitting inside a block whose display lines are the raw source
-/// (which is the case for the edit-mode block-level toggle: the active
-/// block is substituted with `make_raw_block`). Falls back to the start of
-/// the containing block if no match.
-fn cursor_to_xy(
-    blocks: &[BlockInfo],
-    source: &str,
-    lines: &[Line<'static>],
-    cursor: usize,
-) -> Option<(u16, u16)> {
-    // Find the block containing the cursor.
-    let block = blocks
-        .iter()
-        .find(|b| b.source_range.start <= cursor && cursor <= b.source_range.end)?;
-    let block_src = source.get(block.source_range.clone()).unwrap_or("");
-    // Offset of cursor within the block's source.
-    let cursor_in_block = cursor.saturating_sub(block.source_range.start);
-    // Walk source lines to find which one and which byte-within-line the
-    // cursor lands on.
-    let mut byte_idx = 0usize;
-    let mut line_idx = 0usize;
-    for line in block_src.split('\n') {
-        let line_len_bytes = line.len();
-        if cursor_in_block <= byte_idx + line_len_bytes {
-            // Cursor is in this line. Convert byte offset within line to
-            // display column via Unicode width up to the cursor.
-            let col_byte = cursor_in_block - byte_idx;
-            let prefix = line.get(..col_byte).unwrap_or("");
-            let col = UnicodeWidthStr::width(prefix.trim_end_matches('\r'));
-            let display_line = block.display_start + line_idx;
-            if display_line >= lines.len() { return None; }
-            return Some((col as u16, display_line as u16));
-        }
-        // Account for the `\n` separator that split() consumed.
-        byte_idx += line_len_bytes + 1;
-        line_idx += 1;
-    }
-    None
 }
 
 #[derive(Clone, Debug)]
@@ -875,6 +971,7 @@ fn wrap_runs(
     out_checkboxes: &mut Vec<CheckboxSpan>,
     checkboxes: &[PendingCheckbox],
     image_lines: &mut [Option<usize>],
+    cursor_xy: &mut Option<(u16, u16)>,
 ) {
     let prefix_width: usize = prefix.iter().map(|r| r.text.width()).sum();
     let hanging_width: usize = hanging.iter().map(|r| r.text.width()).sum();
@@ -955,6 +1052,15 @@ fn wrap_runs(
     };
 
     for run in runs {
+        // Snapshot (line, col) at the start of this run so we can locate
+        // cursor_at after emit. We assume the substituted inline element
+        // (the one with cursor_at) doesn't internally wrap — true for
+        // `**bold**`, `[text](url)`, `` `code` ``, and other no-space spans.
+        // If it does wrap, the cursor lands at the run-start position
+        // (still inside the substituted text, just possibly at a row above
+        // its true location). Acceptable for an MVP.
+        let cursor_run_start = run.cursor_at.map(|c| (out_lines.len() as u16, cur_col as u16, c));
+
         // Capture checkbox start position before emit; close after.
         let cb_start = run.checkbox.map(|ci| (ci, out_lines.len(), cur_col));
         // Pin the image's output line at the moment its placeholder is emitted.
@@ -1070,6 +1176,13 @@ fn wrap_runs(
                     checked: checkboxes[ci].checked,
                 });
             }
+        }
+
+        // If this run carried cursor_at, compute its display position now.
+        if let Some((start_line, start_col, c)) = cursor_run_start {
+            let pre = run.text.get(..c.min(run.text.len())).unwrap_or("");
+            let cursor_col = start_col + pre.width() as u16;
+            *cursor_xy = Some((cursor_col, start_line));
         }
     }
 
@@ -1421,6 +1534,8 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
                     link: run.link,
                     checkbox: run.checkbox,
                     image: run.image,
+                    inline_range: run.inline_range.clone(),
+                    cursor_at: None,
                 });
             }
             break;
@@ -1431,7 +1546,7 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
         style: Style::default(),
         link: None,
         checkbox: None,
-        image: None,
+        image: None, inline_range: None, cursor_at: None
     });
     out
 }
