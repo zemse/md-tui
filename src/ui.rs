@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{self, App, BrowserEntryKind, View};
+use crate::app::{self, App, BrowserEntryKind, Focus, View};
 use crate::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -52,23 +52,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(1),    // body
-            Constraint::Length(1), // status
+            Constraint::Min(1),     // body (full screen except for one row)
+            Constraint::Length(1),  // statusline
         ])
         .split(area);
 
-    let header = chunks[0];
-    let body = chunks[1];
-    let status = chunks[2];
+    let body = chunks[0];
+    let status = chunks[1];
     app.viewport = body;
-    app.header_area = header;
+    app.statusline_area = status;
 
     // Reserve 1 column on the right for the reader scrollbar so layout stays
     // stable whether or not content overflows. Browser ignores this width.
     app.ensure_rendered(body.width.saturating_sub(1));
 
-    draw_header(f, app, header);
     match &app.view {
         View::Reader(_) => draw_reader(f, app, body),
         View::Browser(_) => draw_browser(f, app, body),
@@ -77,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_images_overlay(f, app, body);
     }
 
-    draw_status(f, app, status);
+    draw_statusline(f, app, status);
 
     if app.search.is_some() {
         draw_search(f, app, area);
@@ -86,39 +83,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.help_open {
         draw_help(f, area);
     }
-}
-
-fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
-    if area.width == 0 || area.height == 0 { return; }
-    let theme = &app.opts.theme;
-
-    let path = match &app.view {
-        View::Reader(r) => match &r.origin {
-            crate::app::ReaderOrigin::File(p) => display_path(p, &app.root),
-            crate::app::ReaderOrigin::Stdin => "<stdin>".to_string(),
-        },
-        View::Browser(b) => format!("{}/", display_path(&b.dir, &app.root)),
-    };
-
-    let mut spans: Vec<Span> = Vec::new();
-    app.back_button_hit = None;
-    if !app.history.is_empty() {
-        let label = " ‹ Back ";
-        let start_x = area.x;
-        let end_x = area.x + label.chars().count() as u16;
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default()
-                .bg(theme.status_bg)
-                .fg(theme.status_fg)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-        app.back_button_hit = Some((start_x, end_x));
-    }
-    spans.push(Span::styled(path, Style::default().add_modifier(Modifier::BOLD)));
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Render `p` shortened against the launch root (or `~/`) when one is a prefix.
@@ -165,15 +129,30 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut display_lines: Vec<Line> = Vec::with_capacity(visible_h);
     let mut nums: Vec<Line> = Vec::with_capacity(visible_h);
+    // Suppress the keyboard-focus highlight while the user's been driving
+    // with the mouse — two simultaneous "cursors" was the user's complaint.
+    let show_focus = !app.mouse_recent;
     for i in 0..visible_h {
         let idx = scroll + i;
         if idx >= total { break; }
         let mut line = rendered.lines[idx].clone();
-        if let Some(fi) = r.focused_link {
-            if let Some(link) = rendered.link_map.links.get(fi) {
-                if link.line == idx {
-                    highlight_focused(&mut line, link, theme);
+        if show_focus {
+            match r.focus {
+                Some(Focus::Link(fi)) => {
+                    if let Some(link) = rendered.link_map.links.get(fi) {
+                        if link.line == idx {
+                            highlight_focused(&mut line, link, theme);
+                        }
+                    }
                 }
+                Some(Focus::Checkbox(ci)) => {
+                    if let Some(cb) = rendered.checkbox_map.items.get(ci) {
+                        if cb.line == idx {
+                            highlight_checkbox_hover(&mut line, cb.col_start, cb.col_end);
+                        }
+                    }
+                }
+                None => {}
             }
         }
         if let Some(hi) = r.hover_link {
@@ -494,10 +473,36 @@ fn short_root(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+/// Single-row context-aware statusline. Anatomy from left to right:
+///   ` ‹ Back  path/file.md   <middle>   25% `
+/// where `<middle>` resolves in priority order to the doc-search prompt, the
+/// hover-URL, the keyboard-focus URL, an explicit status message, or a hint
+/// snippet of the most useful current shortcuts.
+///
+/// Edge case (per user request): when the hovered link sits on the bottom-most
+/// body row (visually adjacent to this statusline), the URL gets pulled to the
+/// opposite half of the row from the mouse column so it doesn't crowd the
+/// pointer.
+fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
+    use unicode_width::UnicodeWidthStr;
+
+    if area.width == 0 || area.height == 0 { return; }
     let theme = &app.opts.theme;
 
-    let pos = match &app.view {
+    let bg = Style::default().bg(theme.status_bg).fg(theme.status_fg);
+    let path_style = Style::default().add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.muted);
+
+    // Path (or browser dir) — same display logic as before.
+    let path = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::app::ReaderOrigin::File(p) => display_path(p, &app.root),
+            crate::app::ReaderOrigin::Stdin => "<stdin>".to_string(),
+        },
+        View::Browser(b) => format!("{}/", display_path(&b.dir, &app.root)),
+    };
+
+    let scroll_pos = match &app.view {
         View::Reader(r) => {
             let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
             let h = app.viewport.height as usize;
@@ -512,46 +517,196 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         View::Browser(b) => format!("{}/{}", b.selected + 1, b.entries.len().max(1)),
     };
 
-    let mut middle = String::new();
-    if let View::Reader(r) = &app.view {
-        if let (Some(rendered), Some(hi)) = (r.rendered.as_ref(), r.hover_link.or(r.focused_link)) {
-            if let Some(link) = rendered.link_map.links.get(hi) {
-                middle = describe_target(&link.target);
-            }
+    // Resolve middle content + classify the mode (search / hover / hint).
+    let middle = compute_middle(app);
+
+    // Right span: scroll %.
+    let right = Span::styled(format!(" {} ", scroll_pos), bg);
+    let right_w = UnicodeWidthStr::width(right.content.as_ref());
+
+    // Left span: optional back button + path. Back button may be absent.
+    let mut back_span: Option<Span> = None;
+    app.back_button_hit = None;
+    if !app.history.is_empty() {
+        let label = " ‹ Back ";
+        let start_x = area.x;
+        let end_x = area.x + label.chars().count() as u16;
+        back_span = Some(Span::styled(label.to_string(), bg.add_modifier(Modifier::BOLD)));
+        app.back_button_hit = Some((start_x, end_x));
+    }
+
+    // Detect whether we should apply the bottom-row hover edge case: the
+    // hovered link sits on the last body row, and the user's mouse is over it.
+    let edge_swap = compute_edge_swap(app, &middle);
+
+    // Actually render. Two layouts:
+    //   - default: [back] [path]   middle   right
+    //   - edge_swap to right: [back] [path]              [middle][right]
+    //   - edge_swap to left:  [middle][gap][path]        [right]
+    let total_w = area.width as usize;
+
+    let mut line_spans: Vec<Span<'static>> = Vec::new();
+    let mid_text = middle.text();
+    match edge_swap {
+        EdgeSwap::Right => {
+            // URL pinned to the right of the row (just before scroll%).
+            push_left(&mut line_spans, &back_span, &path, path_style);
+            let mid_styled = Span::styled(format!(" {} ", mid_text), middle.style(theme));
+            let mid_w = UnicodeWidthStr::width(mid_styled.content.as_ref());
+            let used = span_width(&line_spans) + mid_w + right_w;
+            line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            line_spans.push(mid_styled);
+            line_spans.push(right);
         }
-        if let Some(s) = r.doc_search.as_ref() {
-            if s.editing {
-                middle = format!("/{}_", s.query);
-            } else if s.matches.is_empty() {
-                middle = format!("no match: /{}", s.query);
-            } else {
-                middle = format!(
-                    "/{}  [{}/{}]",
-                    s.query,
-                    s.current + 1,
-                    s.matches.len()
-                );
+        EdgeSwap::Left => {
+            // URL takes the left of the row, suppressing the path.
+            if let Some(b) = back_span.clone() { line_spans.push(b); line_spans.push(Span::raw(" ")); }
+            line_spans.push(Span::styled(format!(" {} ", mid_text), middle.style(theme)));
+            let used = span_width(&line_spans) + right_w;
+            line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            line_spans.push(right);
+        }
+        EdgeSwap::None => {
+            // Default layout: [back] [path]   <middle>   <right>
+            push_left(&mut line_spans, &back_span, &path, path_style);
+            if !mid_text.is_empty() {
+                let pad_left = 2usize;
+                let used_left = span_width(&line_spans) + pad_left;
+                let max_mid = total_w
+                    .saturating_sub(used_left)
+                    .saturating_sub(right_w + 2);
+                let truncated = truncate_mid(&mid_text, max_mid);
+                line_spans.push(Span::raw(" ".repeat(pad_left)));
+                line_spans.push(Span::styled(truncated, middle.style(theme)));
             }
+            let used = span_width(&line_spans) + right_w;
+            line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            line_spans.push(right);
         }
     }
+
+    let _ = muted;
+    f.render_widget(Paragraph::new(Line::from(line_spans)), area);
+}
+
+#[derive(Clone, Debug)]
+enum Mid {
+    Hint(String),
+    /// Static status message (e.g. "Copied: ...", "File reloaded").
+    Status(String),
+    /// `/query_` while typing, or `/query  [n/m]` after commit.
+    Search(String),
+    /// Hovered or focused link target.
+    Url { text: String, on_last_row: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EdgeSwap { None, Left, Right }
+
+impl Mid {
+    fn text(&self) -> String {
+        match self {
+            Mid::Hint(s) | Mid::Status(s) | Mid::Search(s) => s.clone(),
+            Mid::Url { text, .. } => text.clone(),
+        }
+    }
+    fn style(&self, theme: &crate::theme::Theme) -> Style {
+        match self {
+            Mid::Url { .. } => Style::default().fg(theme.link).add_modifier(Modifier::UNDERLINED),
+            Mid::Search(_) => Style::default().fg(theme.heading[0]),
+            Mid::Status(_) => Style::default().fg(theme.heading[0]).add_modifier(Modifier::BOLD),
+            Mid::Hint(_) => Style::default().fg(theme.muted),
+        }
+    }
+}
+
+fn compute_middle(app: &App) -> Mid {
     if !app.status.is_empty() {
-        middle = app.status.clone();
+        return Mid::Status(app.status.clone());
     }
+    if let View::Reader(r) = &app.view {
+        if let Some(s) = r.doc_search.as_ref() {
+            let txt = if s.editing {
+                format!("/{}_", s.query)
+            } else if s.matches.is_empty() {
+                format!("no match: /{}", s.query)
+            } else {
+                format!("/{}  [{}/{}]", s.query, s.current + 1, s.matches.len())
+            };
+            return Mid::Search(txt);
+        }
+        if let Some(rendered) = r.rendered.as_ref() {
+            // Hover wins; otherwise fall back to the focused link (if any).
+            let pick = r.hover_link.or_else(|| match r.focus {
+                Some(Focus::Link(i)) => Some(i),
+                _ => None,
+            });
+            if let Some(hi) = pick {
+                if let Some(link) = rendered.link_map.links.get(hi) {
+                    let visible_h = app.viewport.height as usize;
+                    let scroll = r.scroll as usize;
+                    let last_row_idx = scroll + visible_h.saturating_sub(1);
+                    let on_last_row = link.line == last_row_idx;
+                    return Mid::Url { text: describe_target(&link.target), on_last_row };
+                }
+            }
+        }
+    }
+    Mid::Hint(default_hint(app))
+}
 
-    let mid = Span::styled(format!(" {} ", middle), Style::default().fg(theme.muted));
-    let right = Span::styled(
-        format!(" {} ", pos),
-        Style::default()
-            .bg(theme.status_bg)
-            .fg(theme.status_fg)
-            .add_modifier(Modifier::BOLD),
-    );
+fn default_hint(app: &App) -> String {
+    match &app.view {
+        View::Reader(_) => "j/k  d/u  /search  Tab:link  o:open  e:edit  ?:help  q:quit".into(),
+        View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  ?:help  q:quit".into(),
+    }
+}
 
-    let used = unicode_width::UnicodeWidthStr::width(mid.content.as_ref())
-        + unicode_width::UnicodeWidthStr::width(right.content.as_ref());
-    let pad = (area.width as usize).saturating_sub(used);
-    let line = Line::from(vec![mid, Span::raw(" ".repeat(pad)), right]);
-    f.render_widget(Paragraph::new(line), area);
+fn compute_edge_swap(app: &App, middle: &Mid) -> EdgeSwap {
+    match middle {
+        Mid::Url { on_last_row: true, .. } => {
+            let half = app.viewport.width / 2;
+            // Mouse on the left half → push URL to the right (away from cursor).
+            // Mouse on the right half → URL on the left (the user-defined default).
+            if app.last_mouse_col < app.viewport.x + half {
+                EdgeSwap::Right
+            } else {
+                EdgeSwap::Left
+            }
+        }
+        _ => EdgeSwap::None,
+    }
+}
+
+fn push_left(out: &mut Vec<Span<'static>>, back: &Option<Span<'static>>, path: &str, path_style: Style) {
+    if let Some(b) = back.clone() {
+        out.push(b);
+        out.push(Span::raw(" "));
+    } else {
+        out.push(Span::raw(" "));
+    }
+    out.push(Span::styled(path.to_string(), path_style));
+}
+
+fn span_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum()
+}
+
+fn truncate_mid(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if max == 0 { return String::new(); }
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= max { return s.to_string(); }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw + 1 > max { break; }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 fn describe_target(t: &LinkTarget) -> String {
@@ -573,30 +728,32 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let body = vec![
         Line::from("md keybindings"),
         Line::from(""),
-        Line::from("  j / ↓        scroll down / next entry"),
-        Line::from("  k / ↑        scroll up / prev entry"),
-        Line::from("  d / PgDn     half/page down"),
-        Line::from("  u / PgUp     half/page up"),
-        Line::from("  g / G        top / bottom"),
-        Line::from("  Tab / S-Tab  next / prev link"),
-        Line::from("  Enter / →    open file / enter directory / follow link"),
-        Line::from("  Esc / ←      back   (parent directory or previous view; Esc at root quits)"),
-        Line::from("  /            in-doc text search (Reader) / file search (Browser)"),
-        Line::from("  n / N        next / prev match"),
-        Line::from("  T            fuzzy file search (anywhere)"),
-        Line::from("  h / b        back   (history)"),
-        Line::from("  l / f        forward (history)"),
-        Line::from("  e            edit current file in $EDITOR"),
-        Line::from("  o            open in browser (focused link)"),
-        Line::from("  m            toggle mouse (drag-to-select)"),
-        Line::from("  q / Ctrl-C   quit"),
-        Line::from("  ?            toggle this help"),
+        Line::from("  j / k / ↓ ↑      scroll one line"),
+        Line::from("  d / u            half page down / up"),
+        Line::from("  Ctrl-d / Ctrl-u  half page (vim)"),
+        Line::from("  Ctrl-f / Ctrl-b  full page (vim)"),
+        Line::from("  PgDn / Space     page down"),
+        Line::from("  gg               top of buffer"),
+        Line::from("  G                bottom of buffer (NG → line N)"),
+        Line::from("  H / M / L        focus visible top / middle / bottom"),
+        Line::from("  zz               center current focus"),
+        Line::from("  <count><motion>  e.g. 5j, 10G, 3Ctrl-d"),
         Line::from(""),
-        Line::from("  In search:   type to filter, ↑/↓ navigate,"),
-        Line::from("               Enter open, Esc cancel,"),
-        Line::from("               Ctrl-U clear query."),
+        Line::from("  Tab / S-Tab      cycle focus across links + checkboxes"),
+        Line::from("  Enter / →        follow link or toggle checkbox"),
+        Line::from("  Esc / ←          back  (Esc at root quits)"),
+        Line::from("  /                in-doc text search (Reader) / file search (Browser)"),
+        Line::from("  n / N            next / prev match"),
+        Line::from("  T                fuzzy file search"),
+        Line::from("  h / b            history back"),
+        Line::from("  l / f            history forward"),
+        Line::from("  e                edit current file in $EDITOR"),
+        Line::from("  o                open focused link in browser"),
+        Line::from("  m                toggle mouse capture (drag-to-select)"),
+        Line::from("  q / Ctrl-C       quit"),
+        Line::from("  ?                toggle this help"),
         Line::from(""),
-        Line::from("  Mouse: wheel scrolls; click follows links."),
+        Line::from("  Mouse hides the keyboard focus halo. Any key restores it."),
     ];
     let block = Block::default().borders(Borders::ALL).title(" Help ");
     let para = Paragraph::new(body).block(block);

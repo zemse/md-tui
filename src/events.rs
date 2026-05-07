@@ -8,8 +8,17 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use crate::app::{self, App, BrowserEntry, BrowserEntryKind, EntryKind, SearchResult, View};
+use crate::app::{self, App, BrowserEntry, BrowserEntryKind, EntryKind, Focus, SearchResult, View};
 use crate::ui;
+
+/// Two-key vim chord (g, z) timeout.
+const CHORD_TIMEOUT_MS: u128 = 700;
+
+/// Take the buffered numeric prefix (or `1` if none), clamped to a sane
+/// minimum so motion arms always make progress.
+fn consume_count(prefix: &mut Option<u32>) -> i32 {
+    prefix.take().unwrap_or(1).max(1) as i32
+}
 
 pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
     while !app.should_quit {
@@ -34,6 +43,10 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // Any key press hides the mouse-driven cursor suppression so the keyboard
+    // focus highlight reappears.
+    app.mouse_recent = false;
+
     // Ctrl+C is a hard exit no matter what overlay is on screen.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
@@ -54,17 +67,74 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             return handle_doc_search_key(app, key);
         }
     }
+
+    // Time-out stale chord state before interpreting the next key.
+    let now = std::time::Instant::now();
+    if let Some(t) = app.pending_g {
+        if now.duration_since(t).as_millis() > CHORD_TIMEOUT_MS {
+            app.pending_g = None;
+        }
+    }
+    if let Some(t) = app.pending_z {
+        if now.duration_since(t).as_millis() > CHORD_TIMEOUT_MS {
+            app.pending_z = None;
+        }
+    }
+
+    // Resolve `gg` / `zz` chord completions before falling into the main match.
+    if app.pending_g.is_some() {
+        app.pending_g = None;
+        if let KeyCode::Char('g') = key.code {
+            scroll_to(app, 0);
+            app.count_prefix = None;
+            return Ok(());
+        }
+        // Anything else: cancel the chord and fall through to normal handling.
+    }
+    if app.pending_z.is_some() {
+        app.pending_z = None;
+        if let KeyCode::Char('z') = key.code {
+            center_focus_or_top(app);
+            app.count_prefix = None;
+            return Ok(());
+        }
+    }
+
+    // Numeric prefix: digits are buffered into `count_prefix` until a motion
+    // key consumes them. Plain `0` resets the count *only* if no count is
+    // already being typed (matches vim — `0` on its own is "go to col 0",
+    // which doesn't apply to a viewer).
+    if let KeyCode::Char(c) = key.code {
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            && c.is_ascii_digit()
+            && (c != '0' || app.count_prefix.is_some())
+        {
+            let d = c.to_digit(10).unwrap();
+            let cur = app.count_prefix.unwrap_or(0);
+            // Cap at 99,999 to keep behavior sane on accidental key-mash.
+            let next = (cur.saturating_mul(10)).saturating_add(d).min(99_999);
+            app.count_prefix = Some(next);
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
-            // First, dismiss any committed in-doc search overlay.
+            // Cancel any in-progress count or chord first.
+            if app.count_prefix.is_some() || app.pending_g.is_some() || app.pending_z.is_some() {
+                app.count_prefix = None;
+                app.pending_g = None;
+                app.pending_z = None;
+                return Ok(());
+            }
+            // Dismiss any committed in-doc search overlay.
             if let View::Reader(r) = &app.view {
                 if r.doc_search.is_some() {
                     app.close_doc_search();
                     return Ok(());
                 }
             }
-            // Walk back through history; at the root, Esc quits.
             if !app.history.is_empty() {
                 app.go_back()?;
             } else {
@@ -82,36 +152,138 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('m') => toggle_mouse(app),
         KeyCode::Char('e') => edit_current_file(app)?,
 
-        // Navigation
-        KeyCode::Char('h') | KeyCode::Char('b') | KeyCode::Backspace => app.go_back()?,
-        KeyCode::Char('l') | KeyCode::Char('f') => app.go_forward()?,
+        // Vim-style scrolling. Ctrl-modified arms come *before* unguarded
+        // letter arms so the modifier path can match.
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, n, true);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, -n, true);
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, n, false);
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, -n, false);
+        }
 
-        // Scrolling
-        KeyCode::Char('j') | KeyCode::Down => scroll_by(app, 1),
-        KeyCode::Char('k') | KeyCode::Up => scroll_by(app, -1),
-        KeyCode::Char('d') => scroll_by_page(app, 1, true),
-        KeyCode::Char('u') => scroll_by_page(app, -1, true),
-        KeyCode::PageDown | KeyCode::Char(' ') => scroll_by_page(app, 1, false),
-        KeyCode::PageUp => scroll_by_page(app, -1, false),
-        KeyCode::Char('g') | KeyCode::Home => scroll_to(app, 0),
-        KeyCode::Char('G') | KeyCode::End => scroll_to(app, u16::MAX),
+        // History (plain `b`/`f`). These don't consume the count.
+        KeyCode::Char('b') | KeyCode::Backspace => app.go_back()?,
+        KeyCode::Char('f') => app.go_forward()?,
 
-        // Link navigation
-        KeyCode::Tab => focus_next_link(app),
-        KeyCode::BackTab => focus_prev_link(app),
+        KeyCode::Char('j') | KeyCode::Down => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by(app, n);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by(app, -n);
+        }
+        // Lowercase shortcuts kept for parity with prior bindings.
+        KeyCode::Char('d') => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, n, true);
+        }
+        KeyCode::Char('u') => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, -n, true);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, n, false);
+        }
+        KeyCode::PageUp => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, -n, false);
+        }
+
+        // `g` is now the first key of `gg`. The count is preserved for the
+        // chord completion to consume.
+        KeyCode::Char('g') => {
+            app.pending_g = Some(std::time::Instant::now());
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            let n = consume_count(&mut app.count_prefix);
+            if n > 1 {
+                scroll_to(app, (n - 1).max(0) as u16);
+            } else {
+                scroll_to(app, u16::MAX);
+            }
+        }
+        KeyCode::Home => scroll_to(app, 0),
+
+        // `z` is the first key of `zz` (center on focus). Lowercase only —
+        // uppercase Z is unbound.
+        KeyCode::Char('z') => {
+            app.pending_z = Some(std::time::Instant::now());
+        }
+
+        // Viewport-relative jumps (vim H/M/L).
+        KeyCode::Char('H') => scroll_viewport_relative(app, ViewportTarget::Top),
+        KeyCode::Char('M') => scroll_viewport_relative(app, ViewportTarget::Middle),
+        KeyCode::Char('L') => scroll_viewport_relative(app, ViewportTarget::Bottom),
+
+        // Focus walks links AND checkboxes.
+        KeyCode::Tab => focus_next(app),
+        KeyCode::BackTab => focus_prev(app),
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
 
-        // Browser navigation: Right enters a directory / opens a file,
-        // Left walks back via history.
+        // Browser navigation arrows.
         KeyCode::Right => enter_or_open(app)?,
         KeyCode::Left => {
             if matches!(app.view, View::Browser(_)) { app.go_back()?; }
         }
+        // `h`/`l` only walk history when not in a count chord. (No conflict
+        // with `gh` etc. since we resolved `pending_g` above already.)
+        KeyCode::Char('h') => app.go_back()?,
+        KeyCode::Char('l') => app.go_forward()?,
 
         _ => {}
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ViewportTarget { Top, Middle, Bottom }
+
+/// Vim H/M/L: place the focused element (or the visible top/middle/bottom
+/// content line) without changing the underlying buffer position. Here, since
+/// we have no separate "cursor line" beyond focus, H/M/L instead pick a focus
+/// target visible on that part of the viewport.
+fn scroll_viewport_relative(app: &mut App, target: ViewportTarget) {
+    let h = app.viewport.height as usize;
+    if let View::Reader(r) = &mut app.view {
+        let Some(rendered) = r.rendered.as_ref() else { return; };
+        let scroll = r.scroll as usize;
+        let last = rendered.lines.len().saturating_sub(1);
+        let want_line = match target {
+            ViewportTarget::Top => scroll,
+            ViewportTarget::Middle => (scroll + h / 2).min(last),
+            ViewportTarget::Bottom => (scroll + h.saturating_sub(1)).min(last),
+        };
+        // Pick the focusable nearest to that line, if any.
+        let mut targets = r.focus_targets();
+        if targets.is_empty() { return; }
+        targets.sort_by_key(|&(_, line, _)| (line as i64 - want_line as i64).abs());
+        r.focus = Some(targets[0].0);
+    }
+}
+
+/// Center the focus line in the viewport. Falls back to centering the top of
+/// the buffer when nothing is focused.
+fn center_focus_or_top(app: &mut App) {
+    let h = app.viewport.height as usize;
+    if let View::Reader(r) = &mut app.view {
+        let line = r.focus_position().map(|(l, _)| l).unwrap_or(0);
+        let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
+        let max_scroll = total.saturating_sub(h);
+        r.scroll = line.saturating_sub(h / 2).min(max_scroll) as u16;
+    }
 }
 
 /// Suspend the TUI, hand the terminal to `$EDITOR` (or `vi`) on the current
@@ -280,8 +452,25 @@ fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
-    // Header: clickable back button.
-    if m.row == app.header_area.y && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+    // Anything other than scroll/move counts as deliberate mouse interaction
+    // and re-engages the mouse-cursor mode (hides the keyboard focus halo).
+    match m.kind {
+        MouseEventKind::Moved
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown => {
+            app.mouse_recent = true;
+            app.last_mouse_col = m.column;
+            app.last_mouse_row = m.row;
+        }
+        _ => {}
+    }
+
+    // Statusline: clickable back button. (Was in the dedicated header row;
+    // since we collapsed the layout it now sits on the statusline.)
+    if m.row == app.statusline_area.y && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
         if let Some((sx, ex)) = app.back_button_hit {
             if m.column >= sx && m.column < ex {
                 if !app.history.is_empty() {
@@ -671,32 +860,28 @@ fn enter_or_open(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn focus_next_link(app: &mut App) {
-    if let View::Reader(r) = &mut app.view {
-        let Some(rendered) = &r.rendered else { return; };
-        let n = rendered.link_map.links.len();
-        if n == 0 { return; }
-        let next = match r.focused_link {
-            Some(i) => (i + 1) % n,
-            None => 0,
-        };
-        r.focused_link = Some(next);
-        let line = rendered.link_map.links[next].line;
-        center_on_line(app, line);
-    }
+fn focus_next(app: &mut App) {
+    walk_focus(app, 1);
 }
 
-fn focus_prev_link(app: &mut App) {
+fn focus_prev(app: &mut App) {
+    walk_focus(app, -1);
+}
+
+/// Cycle focus by `delta` through the unified link+checkbox list.
+fn walk_focus(app: &mut App, delta: i32) {
     if let View::Reader(r) = &mut app.view {
-        let Some(rendered) = &r.rendered else { return; };
-        let n = rendered.link_map.links.len();
+        let targets = r.focus_targets();
+        let n = targets.len();
         if n == 0 { return; }
-        let prev = match r.focused_link {
-            Some(0) | None => n - 1,
-            Some(i) => i - 1,
+        let cur_idx = r.focus.and_then(|f| targets.iter().position(|(t, _, _)| *t == f));
+        let new_idx: usize = match cur_idx {
+            Some(i) => ((i as i32 + delta).rem_euclid(n as i32)) as usize,
+            None if delta >= 0 => 0,
+            None => n - 1,
         };
-        r.focused_link = Some(prev);
-        let line = rendered.link_map.links[prev].line;
+        let (focus, line, _col) = targets[new_idx];
+        r.focus = Some(focus);
         center_on_line(app, line);
     }
 }
@@ -713,9 +898,13 @@ fn center_on_line(app: &mut App, line: usize) {
 }
 
 fn activate(app: &mut App) -> Result<()> {
-    match &app.view {
-        View::Reader(r) => {
-            if let Some(fi) = r.focused_link {
+    let focus = match &app.view {
+        View::Reader(r) => r.focus,
+        _ => None,
+    };
+    match focus {
+        Some(Focus::Link(fi)) => {
+            if let View::Reader(r) = &app.view {
                 if let Some(rendered) = &r.rendered {
                     if let Some(link) = rendered.link_map.links.get(fi) {
                         let target = link.target.clone();
@@ -723,16 +912,21 @@ fn activate(app: &mut App) -> Result<()> {
                     }
                 }
             }
-            Ok(())
+            return Ok(());
         }
-        View::Browser(b) => {
-            let entry = b.entries.get(b.selected).cloned();
-            if let Some(e) = entry {
-                activate_browser_entry(app, e)?;
-            }
-            Ok(())
+        Some(Focus::Checkbox(ci)) => {
+            app.toggle_checkbox(ci)?;
+            return Ok(());
+        }
+        None => {}
+    }
+    if let View::Browser(b) = &app.view {
+        let entry = b.entries.get(b.selected).cloned();
+        if let Some(e) = entry {
+            activate_browser_entry(app, e)?;
         }
     }
+    Ok(())
 }
 
 fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
@@ -750,7 +944,7 @@ fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
 
 fn open_focused(app: &mut App) -> Result<()> {
     if let View::Reader(r) = &app.view {
-        if let Some(fi) = r.focused_link {
+        if let Some(Focus::Link(fi)) = r.focus {
             if let Some(rendered) = &r.rendered {
                 if let Some(link) = rendered.link_map.links.get(fi) {
                     if let crate::links::LinkTarget::Url(u) = &link.target {
@@ -805,7 +999,7 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
             }
             if let Some(li) = rendered.link_map.at(line_idx, local_col) {
                 let target = rendered.link_map.links[li].target.clone();
-                r.focused_link = Some(li);
+                r.focus = Some(Focus::Link(li));
                 app.follow(target)?;
             }
             None

@@ -37,10 +37,31 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub viewport: Rect,
-    pub header_area: Rect,
-    /// Last column range occupied by the `[< Back]` button in the header,
+    /// The row containing the statusline. Click handling on this row covers
+    /// the back-button hit zone.
+    pub statusline_area: Rect,
+    /// Last column range occupied by the `[‹ Back]` button in the statusline,
     /// recorded by the renderer so click handling can hit-test it.
     pub back_button_hit: Option<(u16, u16)>,
+    /// Pending vim count prefix (e.g. user typed `5` waiting for `j`). Reset
+    /// after the motion key consumes it, or on Esc.
+    pub count_prefix: Option<u32>,
+    /// `Some(instant)` when the user pressed `g` and we're waiting for the
+    /// second key of a `gg`/`ge`/`gh`-style chord. Times out after ~700ms so
+    /// a stray `g` doesn't lock subsequent input.
+    pub pending_g: Option<std::time::Instant>,
+    /// `Some(instant)` waiting for the second key of a `zz` chord.
+    pub pending_z: Option<std::time::Instant>,
+    /// True when the most recent input was a mouse event. While set we hide
+    /// the keyboard focus highlight so the user isn't tracking two cursors.
+    pub mouse_recent: bool,
+    /// Last observed mouse column inside the body. Used by the statusline
+    /// hover-URL edge case to decide which side of the row to render on when
+    /// the hovered link sits on the bottom-most body row.
+    pub last_mouse_col: u16,
+    /// Last observed mouse row. Together with `last_mouse_col` lets the
+    /// statusline detect "mouse is right above the statusline" cases.
+    pub last_mouse_row: u16,
     /// Mouse capture state. When `false`, drag/click events fall through to
     /// the terminal so the user can select text natively.
     pub mouse_enabled: bool,
@@ -86,7 +107,9 @@ pub struct Reader {
     pub raw: String,
     pub rendered: Option<Rendered>,
     pub scroll: u16,
-    pub focused_link: Option<usize>,
+    /// Unified keyboard cursor. Walks links AND checkboxes in document order
+    /// via Tab / S-Tab. Suppressed visually while the mouse is recent.
+    pub focus: Option<Focus>,
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
     pub doc_search: Option<DocSearch>,
@@ -94,6 +117,12 @@ pub struct Reader {
     /// event loop to detect external edits and reload. `None` for stdin or
     /// when the metadata wasn't available at load time.
     pub last_meta: Option<(std::time::SystemTime, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Link(usize),
+    Checkbox(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -182,8 +211,14 @@ impl App {
             should_quit: false,
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
-            header_area: Rect::new(0, 0, 0, 0),
+            statusline_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
+            count_prefix: None,
+            pending_g: None,
+            pending_z: None,
+            mouse_recent: false,
+            last_mouse_col: 0,
+            last_mouse_row: 0,
             mouse_enabled: true,
             last_click: None,
             scroll_accum: 0.0,
@@ -370,7 +405,7 @@ impl App {
         r.rendered = None;
         r.hover_link = None;
         r.hover_checkbox = None;
-        r.focused_link = None;
+        r.focus = None;
         if let Some(ds) = &mut r.doc_search {
             ds.matches.clear();
             ds.current = 0;
@@ -658,12 +693,37 @@ impl Reader {
             raw,
             rendered: None,
             scroll: 0,
-            focused_link: None,
+            focus: None,
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
             last_meta,
         })
+    }
+
+    /// All focusable spans (links + checkboxes) sorted by (line, col_start).
+    /// Returns `(Focus, line, col_start)` triples so callers can scroll to or
+    /// highlight the focused element without re-deriving the position.
+    pub fn focus_targets(&self) -> Vec<(Focus, usize, usize)> {
+        let mut out: Vec<(Focus, usize, usize)> = Vec::new();
+        let Some(rd) = self.rendered.as_ref() else { return out };
+        for (i, l) in rd.link_map.links.iter().enumerate() {
+            out.push((Focus::Link(i), l.line, l.col_start));
+        }
+        for (i, c) in rd.checkbox_map.items.iter().enumerate() {
+            out.push((Focus::Checkbox(i), c.line, c.col_start));
+        }
+        out.sort_by_key(|&(_, line, col)| (line, col));
+        out
+    }
+
+    /// Resolve the current focus (if any) to its (line, col_start) position.
+    pub fn focus_position(&self) -> Option<(usize, usize)> {
+        let rd = self.rendered.as_ref()?;
+        match self.focus? {
+            Focus::Link(i) => rd.link_map.links.get(i).map(|l| (l.line, l.col_start)),
+            Focus::Checkbox(i) => rd.checkbox_map.items.get(i).map(|c| (c.line, c.col_start)),
+        }
     }
 
     pub fn from_string(raw: String) -> Self {
@@ -672,7 +732,7 @@ impl Reader {
             raw,
             rendered: None,
             scroll: 0,
-            focused_link: None,
+            focus: None,
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
@@ -1119,6 +1179,44 @@ mod tests {
 
         // History still has the original root, so we're not "stuck".
         assert!(!app.history.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn focus_targets_interleaves_links_and_checkboxes_in_document_order() {
+        let dir = fresh_temp("focus-targets");
+        let path = dir.join("doc.md");
+        // Two links, two checkboxes, intentionally interleaved so plain
+        // sequential indexing wouldn't yield document order.
+        let src = "\
+- [ ] task one with [link a](https://a)\n\
+\n\
+[link b](https://b)\n\
+\n\
+- [x] task two\n";
+        std::fs::write(&path, src).unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else { panic!("expected reader") };
+
+        let targets = r.focus_targets();
+        // Expect 4 items: cb0, link0 (same line as cb0), link1, cb1.
+        assert_eq!(targets.len(), 4, "got {:?}", targets);
+        let kinds: Vec<&'static str> = targets
+            .iter()
+            .map(|(f, _, _)| match f {
+                Focus::Link(_) => "link",
+                Focus::Checkbox(_) => "cb",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["cb", "link", "link", "cb"], "ordering: {:?}", targets);
+
+        // The lines must be monotonically non-decreasing.
+        for w in targets.windows(2) {
+            assert!(w[0].1 <= w[1].1, "lines not in order: {:?}", targets);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
