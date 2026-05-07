@@ -66,6 +66,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         if r.doc_search.as_ref().map(|s| s.editing).unwrap_or(false) {
             return handle_doc_search_key(app, key);
         }
+        // Edit mode: keys go to the in-house editor instead of the viewer.
+        if r.edit.is_some() {
+            return handle_edit_key(app, key);
+        }
     }
 
     // Time-out stale chord state before interpreting the next key.
@@ -150,7 +154,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('n') => app.doc_search_step(true),
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
-        KeyCode::Char('e') => edit_current_file(app)?,
+        KeyCode::Char('e') => app.enter_edit(),
 
         // Vim-style scrolling. Ctrl-modified arms come *before* unguarded
         // letter arms so the modifier path can match.
@@ -286,54 +290,69 @@ fn center_focus_or_top(app: &mut App) {
     }
 }
 
-/// Suspend the TUI, hand the terminal to `$EDITOR` (or `vi`) on the current
-/// reader file, then restore raw mode and reload the file. No-op for stdin.
-fn edit_current_file(app: &mut App) -> Result<()> {
-    use crossterm::execute;
-    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+/// Edit-mode key handler. Active while `Reader::edit.is_some()`. Plain text
+/// goes into the buffer; arrows/home/end/etc. move the source cursor; Ctrl-S
+/// (or Ctrl-W backup) saves; Esc arms a discard prompt that the second Esc
+/// confirms. Mouse handling stays in `handle_mouse` and updates the cursor
+/// from click position there.
+fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    let path = match &app.view {
-        View::Reader(r) => match &r.origin {
-            crate::app::ReaderOrigin::File(p) => p.clone(),
-            crate::app::ReaderOrigin::Stdin => {
-                app.status = "Cannot edit: source is stdin".into();
-                return Ok(());
-            }
-        },
-        _ => return Ok(()),
-    };
-
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
-
-    // Restore the terminal so the editor has full control.
-    disable_raw_mode().ok();
-    let mut out = stdout();
-    execute!(out, LeaveAlternateScreen, DisableMouseCapture).ok();
-
-    let status = std::process::Command::new(&editor).arg(&path).status();
-
-    // Restore TUI state in all cases.
-    enable_raw_mode().ok();
-    execute!(out, EnterAlternateScreen).ok();
-    if app.mouse_enabled {
-        execute!(out, EnableMouseCapture).ok();
+    // Ctrl-C is the hard escape hatch (handled above before we get here in
+    // practice, but kept defensively in case dispatch shifts).
+    if ctrl && matches!(key.code, KeyCode::Char('c')) {
+        app.should_quit = true;
+        return Ok(());
     }
 
-    match status {
-        Ok(s) if s.success() => {
-            // Reload the file from disk so any edits are reflected.
-            if let View::Reader(r) = &mut app.view {
-                if let Ok(raw) = std::fs::read_to_string(&path) {
-                    r.raw = raw;
-                    r.rendered = None;
-                    app.status = format!("Reloaded {}", editor);
+    // Save: Ctrl-S primary, Ctrl-W backup (some terminals eat Ctrl-S as
+    // XOFF / flow control).
+    if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('w')) {
+        app.save_edit()?;
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            // First Esc arms; second Esc discards. Anything else clears it
+            // (handled inside the mutation helpers via `discard_pending = false`).
+            let armed = matches!(
+                &app.view,
+                View::Reader(r) if r.edit.as_ref().map(|e| e.discard_pending).unwrap_or(false)
+            );
+            if armed {
+                app.exit_edit_discard();
+            } else if let View::Reader(r) = &mut app.view {
+                if let Some(e) = r.edit.as_mut() {
+                    e.discard_pending = true;
                 }
             }
+            return Ok(());
         }
-        Ok(_) => app.status = format!("{} exited non-zero", editor),
-        Err(e) => app.status = format!("{}: {}", editor, e),
+        KeyCode::Left => app.edit_move_horizontal(-1),
+        KeyCode::Right => app.edit_move_horizontal(1),
+        KeyCode::Up => app.edit_move_vertical(-1),
+        KeyCode::Down => app.edit_move_vertical(1),
+        KeyCode::Home => app.edit_move_line_edge(false),
+        KeyCode::End => app.edit_move_line_edge(true),
+        KeyCode::Backspace => app.edit_backspace(),
+        KeyCode::Delete => app.edit_delete(),
+        KeyCode::Enter => app.edit_insert("\n"),
+        KeyCode::Tab => app.edit_insert("  "),
+        KeyCode::Char(c) if !ctrl => {
+            // Buffer the char as a UTF-8 string. Single-char allocation is
+            // negligible compared to the re-render that follows.
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            app.edit_insert(s);
+        }
+        _ => {
+            // Anything else clears the discard arm so a stray modifier press
+            // doesn't leave the prompt up.
+            if let View::Reader(r) = &mut app.view {
+                if let Some(e) = r.edit.as_mut() { e.discard_pending = false; }
+            }
+        }
     }
     Ok(())
 }
@@ -713,6 +732,49 @@ mod word_tests {
     }
 }
 
+/// Map a display (line_idx, col) to a source byte offset, using the per-block
+/// info recorded during rendering. Only valid when the cursor's containing
+/// block is being shown raw (edit mode block-level toggle), since that's the
+/// only case where a display line corresponds 1:1 with a source line.
+fn xy_to_source_offset(
+    rendered: &crate::markdown::Rendered,
+    source: &str,
+    line_idx: usize,
+    col: usize,
+) -> Option<usize> {
+    use unicode_width::UnicodeWidthChar;
+    // Find the block that contains this line. If the cursor's current block
+    // is the one being shown raw, that's where the click should land. Other
+    // blocks are formatted, so clicking on them moves the cursor to the
+    // start of that block (then on the next render that block becomes raw).
+    let block = rendered.blocks.iter().find(|b| {
+        line_idx >= b.display_start && line_idx < b.display_end
+    })?;
+    let line_in_block = line_idx - block.display_start;
+    let block_src = source.get(block.source_range.clone())?;
+    // Find the n-th source line (separated by `\n`).
+    let mut byte = 0usize;
+    let mut idx = 0usize;
+    for line in block_src.split('\n') {
+        if idx == line_in_block {
+            // Walk chars until we accumulate `col` display width.
+            let mut taken_width = 0usize;
+            for (i, ch) in line.char_indices() {
+                let w = ch.width().unwrap_or(0);
+                if taken_width + w > col {
+                    return Some(block.source_range.start + byte + i);
+                }
+                taken_width += w;
+            }
+            // Click past end of line → land at end of this line.
+            return Some(block.source_range.start + byte + line.len());
+        }
+        byte += line.len() + 1; // +1 for the consumed `\n`
+        idx += 1;
+    }
+    Some(block.source_range.start)
+}
+
 /// Walk left and right from `target_col` in `line` (using display widths) to
 /// find the run of non-whitespace characters covering that column.
 fn word_at_col(line: &str, target_col: usize) -> Option<String> {
@@ -1023,6 +1085,19 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
             let local_col = (col - inner_x) as usize;
             let local_row = (row - area.y) as usize;
             let line_idx = r.scroll as usize + local_row;
+            // Edit mode: click sets the source cursor and never follows links
+            // / toggles checkboxes (so the user can edit link text without
+            // having every click navigate away).
+            if r.edit.is_some() {
+                if let Some(offset) = xy_to_source_offset(rendered, &r.raw, line_idx, local_col) {
+                    if let Some(e) = r.edit.as_mut() {
+                        e.cursor = offset;
+                        e.discard_pending = false;
+                    }
+                    r.rendered = None;
+                }
+                return Ok(());
+            }
             // Checkbox takes priority over link (the marker isn't part of any link).
             if let Some(ci) = rendered.checkbox_map.at(line_idx, local_col) {
                 app.toggle_checkbox(ci)?;

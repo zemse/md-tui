@@ -22,9 +22,45 @@ pub struct Rendered {
     pub checkbox_map: CheckboxMap,
     pub images: Vec<ImageRef>,
     pub width: u16,
+    /// One entry per block in document order. Lets edit mode locate the
+    /// block containing a given source byte offset.
+    pub blocks: Vec<BlockInfo>,
+    /// Cursor display position when rendered in edit mode. `None` outside
+    /// edit mode.
+    pub cursor_xy: Option<(u16, u16)>,
 }
 
+/// Source-byte range + display-line range for one block. `display_start`/
+/// `display_end` are line indices into `Rendered::lines` (half-open). Edit
+/// mode uses these to map (cursor_offset → block) and to scroll a freshly
+/// raw-substituted block back into view.
+#[derive(Clone, Debug)]
+pub struct BlockInfo {
+    pub source_range: std::ops::Range<usize>,
+    pub display_start: usize,
+    pub display_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditCtx {
+    /// Source byte offset of the cursor.
+    pub cursor: usize,
+}
+
+/// Render markdown to terminal lines. Convenience wrapper around
+/// `render_with_edit`; pass `None` for the edit context when not editing.
+#[cfg(test)]
 pub fn render(source: &str, base_dir: Option<&Path>, width: u16, theme: &Theme) -> Rendered {
+    render_with_edit(source, base_dir, width, theme, None)
+}
+
+pub fn render_with_edit(
+    source: &str,
+    base_dir: Option<&Path>,
+    width: u16,
+    theme: &Theme,
+    edit: Option<EditCtx>,
+) -> Rendered {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -34,7 +70,13 @@ pub fn render(source: &str, base_dir: Option<&Path>, width: u16, theme: &Theme) 
     opts.insert(Options::ENABLE_WIKILINKS);
 
     let parser = Parser::new_ext(source, opts).into_offset_iter();
-    let mut b = Builder::new(theme.clone(), width as usize, base_dir.map(|p| p.to_path_buf()));
+    let mut b = Builder::new(
+        theme.clone(),
+        width as usize,
+        base_dir.map(|p| p.to_path_buf()),
+        source.to_string(),
+        edit,
+    );
     for (ev, range) in parser {
         b.event(ev, range);
     }
@@ -52,6 +94,14 @@ struct Run {
     /// Index into `images` if this run is an image placeholder. Recorded so
     /// the layout pass can map (image idx → output line) for later rendering.
     image: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockEntry {
+    block: Block,
+    /// Source byte range. `0..0` for synthetic Blank blocks emitted by the
+    /// builder to insert vertical spacing — those have no analogue in source.
+    source_range: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,8 +128,10 @@ struct Builder {
     theme: Theme,
     width: usize,
     base_dir: Option<PathBuf>,
+    source: String,
+    edit: Option<EditCtx>,
 
-    blocks: Vec<Block>,
+    blocks: Vec<BlockEntry>,
     /// Pending links awaiting layout — index in this vec is referenced by `Run.link`.
     links: Vec<PendingLink>,
     /// Pending task-list checkboxes awaiting layout — index referenced by `Run.checkbox`.
@@ -135,12 +187,14 @@ struct ListFrame {
 }
 
 impl Builder {
-    fn new(theme: Theme, width: usize, base_dir: Option<PathBuf>) -> Self {
+    fn new(theme: Theme, width: usize, base_dir: Option<PathBuf>, source: String, edit: Option<EditCtx>) -> Self {
         let width = if width == 0 { 80 } else { width };
         Self {
             theme,
             width,
             base_dir,
+            source,
+            edit,
             blocks: Vec::new(),
             links: Vec::new(),
             checkboxes: Vec::new(),
@@ -217,7 +271,17 @@ impl Builder {
         (prefix, hanging)
     }
 
-    fn finish_paragraph(&mut self) {
+    fn push_block(&mut self, block: Block, source_range: std::ops::Range<usize>) {
+        self.blocks.push(BlockEntry { block, source_range });
+    }
+
+    /// Spacer block emitted between content blocks. No source range — the
+    /// renderer treats the cursor as never landing on these.
+    fn push_blank(&mut self) {
+        self.blocks.push(BlockEntry { block: Block::Blank, source_range: 0..0 });
+    }
+
+    fn finish_paragraph(&mut self, source_range: std::ops::Range<usize>) {
         if self.cur_runs.is_empty() && self.cur_prefix.is_empty() {
             return;
         }
@@ -226,7 +290,7 @@ impl Builder {
         let mut hanging = self.quote_prefix();
         hanging.extend(self.cur_hanging.drain(..));
         let runs = std::mem::take(&mut self.cur_runs);
-        self.blocks.push(Block::Paragraph { runs, prefix, hanging });
+        self.push_block(Block::Paragraph { runs, prefix, hanging }, source_range);
     }
 
     fn push_text(&mut self, text: &str) {
@@ -250,7 +314,7 @@ impl Builder {
     fn event(&mut self, ev: Event<'_>, range: std::ops::Range<usize>) {
         match ev {
             Event::Start(tag) => self.start_tag(tag),
-            Event::End(tag) => self.end_tag(tag),
+            Event::End(tag) => self.end_tag(tag, range.clone()),
             Event::Text(s) => self.push_text(&s),
             Event::Code(s) => {
                 let style = self
@@ -297,7 +361,7 @@ impl Builder {
                     image: None,
                 });
             }
-            Event::Rule => self.blocks.push(Block::Rule),
+            Event::Rule => self.push_block(Block::Rule, range.clone()),
             Event::TaskListMarker(checked) => {
                 let glyph = if checked { "[x]" } else { "[ ]" };
                 let style = Style::default()
@@ -434,27 +498,27 @@ impl Builder {
         }
     }
 
-    fn end_tag(&mut self, tag: TagEnd) {
+    fn end_tag(&mut self, tag: TagEnd, range: std::ops::Range<usize>) {
         match tag {
             TagEnd::Paragraph => {
-                self.finish_paragraph();
-                self.blocks.push(Block::Blank);
+                self.finish_paragraph(range);
+                self.push_blank();
             }
             TagEnd::Heading(_) => {
                 self.in_heading = None;
                 let anchor = links::slugify(&self.heading_buf);
                 self.style_stack.pop();
                 let runs = std::mem::take(&mut self.cur_runs);
-                self.blocks.push(Block::Blank);
-                self.blocks.push(Block::Heading { runs, anchor });
-                self.blocks.push(Block::Blank);
+                self.push_blank();
+                self.push_block(Block::Heading { runs, anchor }, range);
+                self.push_blank();
                 self.cur_prefix.clear();
                 self.cur_hanging.clear();
             }
             TagEnd::BlockQuote(_) => {
                 if self.quote_depth > 0 { self.quote_depth -= 1; }
                 if self.quote_depth == 0 {
-                    self.blocks.push(Block::Blank);
+                    self.push_blank();
                 }
             }
             TagEnd::CodeBlock => {
@@ -484,17 +548,17 @@ impl Builder {
                     .collect();
                 let prefix = self.quote_prefix();
                 self.code_content.clear();
-                self.blocks.push(Block::Pre { lines, prefix });
-                self.blocks.push(Block::Blank);
+                self.push_block(Block::Pre { lines, prefix }, range);
+                self.push_blank();
             }
             TagEnd::List(_) => {
                 self.list_stack.pop();
                 if self.list_stack.is_empty() {
-                    self.blocks.push(Block::Blank);
+                    self.push_blank();
                 }
             }
             TagEnd::Item => {
-                self.finish_paragraph();
+                self.finish_paragraph(range);
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.pop_style();
@@ -505,12 +569,15 @@ impl Builder {
             }
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
-                    self.blocks.push(Block::Table {
-                        alignments: t.alignments,
-                        header: t.header,
-                        rows: t.rows,
-                    });
-                    self.blocks.push(Block::Blank);
+                    self.push_block(
+                        Block::Table {
+                            alignments: t.alignments,
+                            header: t.header,
+                            rows: t.rows,
+                        },
+                        range,
+                    );
+                    self.push_blank();
                 }
             }
             TagEnd::TableHead => {
@@ -534,16 +601,60 @@ impl Builder {
     }
 
     fn finish(mut self) -> Rendered {
-        self.finish_paragraph();
+        // Best-effort flush of any in-flight paragraph runs. The synthetic
+        // range covers from the run start (if known) to current source end —
+        // edit mode tolerates `0..source.len()` as a fallback since the
+        // cursor will only land in committed blocks via the `blocks` list.
+        let pseudo = 0..self.source.len();
+        self.finish_paragraph(pseudo);
+        // Apply block-level raw substitution if the cursor is inside any
+        // committed block. This is the MVP edit-mode "live preview" toggle.
+        if let Some(ctx) = self.edit {
+            for entry in &mut self.blocks {
+                if entry.source_range.is_empty() { continue; }
+                if entry.source_range.start <= ctx.cursor && ctx.cursor < entry.source_range.end {
+                    entry.block = make_raw_block(&self.source, &entry.source_range, &self.theme);
+                }
+            }
+        }
         layout(
             &self.theme,
             self.width,
+            self.source,
             self.blocks,
             self.links,
             self.checkboxes,
             self.images,
+            self.edit,
         )
     }
+}
+
+/// Take a source byte range and produce a `Pre`-like block whose content is
+/// the raw source slice. Used by edit mode to replace the formatted display
+/// of the block under the cursor with its underlying markdown text. We use
+/// the muted text color (no code background) so it visually distinguishes
+/// from real code blocks.
+fn make_raw_block(source: &str, range: &std::ops::Range<usize>, theme: &Theme) -> Block {
+    let slice = source.get(range.clone()).unwrap_or("");
+    let style = Style::default().fg(theme.muted);
+    let lines: Vec<Vec<Run>> = slice
+        .split('\n')
+        .map(|line| {
+            // Strip a single trailing CR so DOS line endings don't leave a
+            // visible glyph at the right edge.
+            let s = line.strip_suffix('\r').unwrap_or(line).to_string();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![Run { text: s, style, link: None, checkbox: None, image: None }]
+            }
+        })
+        .collect();
+    // Render with no left-pad / quote-bar prefix so the raw text aligns to
+    // column 0 — that lets the cursor display position math match the
+    // source-line column directly.
+    Block::Pre { lines, prefix: Vec::new() }
 }
 
 fn heading_idx(l: HeadingLevel) -> usize {
@@ -564,21 +675,27 @@ fn heading_idx(l: HeadingLevel) -> usize {
 fn layout(
     theme: &Theme,
     width: usize,
-    blocks: Vec<Block>,
+    source: String,
+    blocks: Vec<BlockEntry>,
     links: Vec<PendingLink>,
     checkboxes: Vec<PendingCheckbox>,
     images: Vec<PathBuf>,
+    edit: Option<EditCtx>,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut out_links: Vec<LinkSpan> = Vec::new();
     let mut out_checkboxes: Vec<CheckboxSpan> = Vec::new();
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
+    let mut block_infos: Vec<BlockInfo> = Vec::new();
 
     // For each link index, track the open span being built across runs.
     let mut open_spans: Vec<Option<OpenSpan>> = (0..links.len()).map(|_| None).collect();
 
-    for block in blocks {
+    for entry in blocks {
+        let block_start_line = out_lines.len();
+        let block_source_range = entry.source_range.clone();
+        let block = entry.block;
         match block {
             Block::Blank => {
                 if out_lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
@@ -659,7 +776,19 @@ fn layout(
                 }
             }
         }
+        let block_end_line = out_lines.len();
+        if !block_source_range.is_empty() {
+            block_infos.push(BlockInfo {
+                source_range: block_source_range,
+                display_start: block_start_line,
+                display_end: block_end_line,
+            });
+        }
     }
+
+    // Compute cursor display position for edit mode. Map source byte offset
+    // to a (line, col) in the rendered output by walking the block list.
+    let cursor_xy = edit.and_then(|ctx| cursor_to_xy(&block_infos, &source, &out_lines, ctx.cursor));
 
     let link_map = LinkMap {
         links: out_links,
@@ -677,7 +806,50 @@ fn layout(
         checkbox_map,
         images: images_out,
         width: width as u16,
+        blocks: block_infos,
+        cursor_xy,
     }
+}
+
+/// Map a source byte offset to a display (line, col) coordinate. Relies on
+/// the cursor sitting inside a block whose display lines are the raw source
+/// (which is the case for the edit-mode block-level toggle: the active
+/// block is substituted with `make_raw_block`). Falls back to the start of
+/// the containing block if no match.
+fn cursor_to_xy(
+    blocks: &[BlockInfo],
+    source: &str,
+    lines: &[Line<'static>],
+    cursor: usize,
+) -> Option<(u16, u16)> {
+    // Find the block containing the cursor.
+    let block = blocks
+        .iter()
+        .find(|b| b.source_range.start <= cursor && cursor <= b.source_range.end)?;
+    let block_src = source.get(block.source_range.clone()).unwrap_or("");
+    // Offset of cursor within the block's source.
+    let cursor_in_block = cursor.saturating_sub(block.source_range.start);
+    // Walk source lines to find which one and which byte-within-line the
+    // cursor lands on.
+    let mut byte_idx = 0usize;
+    let mut line_idx = 0usize;
+    for line in block_src.split('\n') {
+        let line_len_bytes = line.len();
+        if cursor_in_block <= byte_idx + line_len_bytes {
+            // Cursor is in this line. Convert byte offset within line to
+            // display column via Unicode width up to the cursor.
+            let col_byte = cursor_in_block - byte_idx;
+            let prefix = line.get(..col_byte).unwrap_or("");
+            let col = UnicodeWidthStr::width(prefix.trim_end_matches('\r'));
+            let display_line = block.display_start + line_idx;
+            if display_line >= lines.len() { return None; }
+            return Some((col as u16, display_line as u16));
+        }
+        // Account for the `\n` separator that split() consumed.
+        byte_idx += line_len_bytes + 1;
+        line_idx += 1;
+    }
+    None
 }
 
 #[derive(Clone, Debug)]

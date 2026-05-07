@@ -113,10 +113,26 @@ pub struct Reader {
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
     pub doc_search: Option<DocSearch>,
+    /// In-house edit mode. `Some` while the user is editing this buffer
+    /// in-place (entered via `e`, exited via Esc-Esc).
+    pub edit: Option<EditState>,
     /// (mtime, size) snapshot of the source file at last read. Used by the
     /// event loop to detect external edits and reload. `None` for stdin or
     /// when the metadata wasn't available at load time.
     pub last_meta: Option<(std::time::SystemTime, u64)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditState {
+    /// Cursor position as a byte offset into `Reader::raw`. Always lands on
+    /// a UTF-8 char boundary; helpers in the events layer enforce that.
+    pub cursor: usize,
+    /// True after any insert/delete since the last save or load.
+    pub dirty: bool,
+    /// First Esc arms this; second Esc discards changes and exits edit mode.
+    /// Any other key clears it. Stored as a flag (not a timestamp) so the
+    /// statusline confirm prompt persists until the user makes a choice.
+    pub discard_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +157,7 @@ pub struct DocMatch {
     pub col_end: usize,
 }
 
+#[derive(Clone)]
 pub enum ReaderOrigin {
     File(PathBuf),
     Stdin,
@@ -389,6 +406,10 @@ impl App {
     /// identical content does not count). No-op for stdin or non-Reader views.
     pub fn poll_external_change(&mut self) -> bool {
         let View::Reader(r) = &mut self.view else { return false };
+        // Don't clobber an in-flight edit. The user can resolve any conflict
+        // explicitly by saving (overwrites disk) or discarding via Esc-Esc
+        // (reloads from disk).
+        if r.edit.is_some() { return false; }
         let path = match &r.origin {
             ReaderOrigin::File(p) => p.clone(),
             ReaderOrigin::Stdin => return false,
@@ -514,14 +535,175 @@ impl App {
         r.scroll = new.min(max_scroll) as u16;
     }
 
-    /// Re-render reader if width changed since last render.
+    /// Enter in-house edit mode. Cursor starts at byte 0; nothing dirty;
+    /// no discard pending. No-op for stdin (we'd have nothing to write to).
+    pub fn enter_edit(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            if matches!(r.origin, ReaderOrigin::Stdin) {
+                self.status = "Cannot edit: source is stdin".into();
+                return;
+            }
+            r.edit = Some(EditState { cursor: 0, dirty: false, discard_pending: false });
+            r.rendered = None;
+            self.status.clear();
+        }
+    }
+
+    /// Discard buffer changes and exit edit mode. Reloads the file from disk
+    /// to drop any unsaved edits, then returns the reader to view mode.
+    pub fn exit_edit_discard(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            if r.edit.is_none() { return; }
+            if let ReaderOrigin::File(path) = r.origin.clone() {
+                if let Ok(disk) = std::fs::read_to_string(&path) {
+                    r.raw = disk;
+                    r.last_meta = file_meta(&path);
+                }
+            }
+            r.edit = None;
+            r.rendered = None;
+            self.status = "Edit discarded".into();
+        }
+    }
+
+    /// Exit edit mode without modifying the buffer. Used after a successful
+    /// save: the buffer is already what's on disk, so we just leave edit mode.
+    #[allow(dead_code)]
+    pub fn exit_edit(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            r.edit = None;
+            r.rendered = None;
+        }
+    }
+
+    /// Insert `text` at the current edit cursor and advance the cursor past
+    /// it. Marks dirty. No-op outside edit mode.
+    pub fn edit_insert(&mut self, text: &str) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        let pos = e.cursor.min(r.raw.len());
+        // Snap to the nearest char boundary <= pos so we don't mid-byte split.
+        let pos = floor_char_boundary(&r.raw, pos);
+        r.raw.insert_str(pos, text);
+        e.cursor = pos + text.len();
+        e.dirty = true;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
+    /// Delete `n` chars to the left of the cursor (Backspace). No-op if
+    /// the cursor is at byte 0.
+    pub fn edit_backspace(&mut self) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        if e.cursor == 0 { return; }
+        let end = floor_char_boundary(&r.raw, e.cursor);
+        let prev = prev_char_boundary(&r.raw, end);
+        r.raw.replace_range(prev..end, "");
+        e.cursor = prev;
+        e.dirty = true;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
+    /// Delete one char to the right of the cursor (Delete key).
+    pub fn edit_delete(&mut self) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        let pos = floor_char_boundary(&r.raw, e.cursor);
+        if pos >= r.raw.len() { return; }
+        let next = next_char_boundary(&r.raw, pos);
+        r.raw.replace_range(pos..next, "");
+        e.dirty = true;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
+    /// Move cursor by one char left/right (`delta` ±1). Re-renders so the
+    /// block-level toggle can swap blocks if the cursor crossed a boundary.
+    pub fn edit_move_horizontal(&mut self, delta: i32) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        e.discard_pending = false;
+        let pos = floor_char_boundary(&r.raw, e.cursor);
+        let new = if delta < 0 {
+            prev_char_boundary(&r.raw, pos)
+        } else {
+            next_char_boundary(&r.raw, pos)
+        };
+        if new != e.cursor {
+            e.cursor = new;
+            r.rendered = None;
+        }
+    }
+
+    /// Move the cursor up/down one source line, preserving column where
+    /// possible. Operates on `Reader::raw` directly (not the rendered grid)
+    /// so wrap doesn't confuse the up/down notion.
+    pub fn edit_move_vertical(&mut self, delta: i32) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        e.discard_pending = false;
+        let (line_idx, col) = source_line_col(&r.raw, e.cursor);
+        let target_line = (line_idx as i32 + delta).max(0) as usize;
+        let new = source_offset_for(&r.raw, target_line, col);
+        if new != e.cursor {
+            e.cursor = new;
+            r.rendered = None;
+        }
+    }
+
+    /// Move cursor to start (`bol`) or end (`eol`) of current source line.
+    pub fn edit_move_line_edge(&mut self, eol: bool) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        e.discard_pending = false;
+        let (line_idx, _col) = source_line_col(&r.raw, e.cursor);
+        let new = if eol {
+            source_line_end(&r.raw, line_idx)
+        } else {
+            source_line_start(&r.raw, line_idx)
+        };
+        if new != e.cursor {
+            e.cursor = new;
+            r.rendered = None;
+        }
+    }
+
+    /// Persist the current buffer to disk. Refreshes the on-disk fingerprint
+    /// so the external-change watcher doesn't see our own write as a phantom
+    /// edit on the next tick.
+    pub fn save_edit(&mut self) -> Result<()> {
+        let View::Reader(r) = &mut self.view else { return Ok(()); };
+        if r.edit.is_none() { return Ok(()); }
+        let ReaderOrigin::File(path) = r.origin.clone() else { return Ok(()); };
+        std::fs::write(&path, &r.raw)
+            .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+        r.last_meta = file_meta(&path);
+        if let Some(e) = r.edit.as_mut() {
+            e.dirty = false;
+            e.discard_pending = false;
+        }
+        self.status = format!("Saved {}", path.display());
+        Ok(())
+    }
+
+    /// Re-render reader if width or edit-mode cursor changed since last
+    /// render. Edit mode bypasses the cached render whenever the cursor
+    /// has moved into a different block, since the block-level toggle
+    /// changes the displayed content.
     pub fn ensure_rendered(&mut self, width: u16) {
         let theme = self.opts.theme.clone();
         let user_width = self.opts.width;
         let target_w = if user_width == 0 { width } else { user_width.min(width) };
         if let View::Reader(r) = &mut self.view {
+            // Edit mode invalidates cache aggressively. The renderer is fast
+            // enough at the file sizes a TUI reader handles that re-running
+            // it on every keystroke is acceptable; we can add an
+            // "invalidate-only-when-cursor-crosses-block" optimisation later
+            // if we measure pain.
             let needs = match &r.rendered {
-                Some(rd) => rd.width != target_w,
+                Some(rd) => rd.width != target_w || r.edit.is_some(),
                 None => true,
             };
             if needs {
@@ -529,7 +711,14 @@ impl App {
                     ReaderOrigin::File(p) => p.parent().map(|p| p.to_path_buf()),
                     ReaderOrigin::Stdin => None,
                 };
-                r.rendered = Some(markdown::render(&r.raw, base_dir.as_deref(), target_w, &theme));
+                let edit_ctx = r.edit.as_ref().map(|e| markdown::EditCtx { cursor: e.cursor });
+                r.rendered = Some(markdown::render_with_edit(
+                    &r.raw,
+                    base_dir.as_deref(),
+                    target_w,
+                    &theme,
+                    edit_ctx,
+                ));
                 if let Some(rd) = &r.rendered {
                     let max_scroll = rd.lines.len().saturating_sub(1) as u16;
                     if r.scroll > max_scroll { r.scroll = max_scroll; }
@@ -697,6 +886,7 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
+            edit: None,
             last_meta,
         })
     }
@@ -736,9 +926,94 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             doc_search: None,
+            edit: None,
             last_meta: None,
         }
     }
+}
+
+/// Snap `pos` down to the nearest UTF-8 char boundary <= pos.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() { return s.len(); }
+    let mut p = pos;
+    while p > 0 && !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Byte offset of the next char boundary strictly after `pos`. Returns
+/// `s.len()` if `pos` is already at end.
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() { return s.len(); }
+    let mut p = pos + 1;
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
+
+/// Byte offset of the previous char boundary strictly before `pos`. Returns
+/// 0 if `pos` is already at the start.
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    if pos == 0 { return 0; }
+    let mut p = pos - 1;
+    while p > 0 && !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Convert a byte offset to (line index, char column within line). Lines
+/// are split on `\n`; CR is ignored. Column is in chars, not display width.
+fn source_line_col(s: &str, pos: usize) -> (usize, usize) {
+    let pos = pos.min(s.len());
+    let head = &s[..pos];
+    let line = head.bytes().filter(|&b| b == b'\n').count();
+    let col_bytes = head.rfind('\n').map(|i| pos - i - 1).unwrap_or(pos);
+    let col = s[pos - col_bytes..pos].chars().count();
+    (line, col)
+}
+
+/// Byte offset of the first char of `line`. Out-of-range lines return
+/// `s.len()`.
+fn source_line_start(s: &str, line: usize) -> usize {
+    if line == 0 { return 0; }
+    let mut count = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            count += 1;
+            if count == line {
+                return i + 1;
+            }
+        }
+    }
+    s.len()
+}
+
+/// Byte offset of the last char of `line` (i.e. the position just before
+/// the trailing `\n`, or `s.len()` for the last line).
+fn source_line_end(s: &str, line: usize) -> usize {
+    let start = source_line_start(s, line);
+    s[start..]
+        .find('\n')
+        .map(|i| start + i)
+        .unwrap_or(s.len())
+}
+
+/// Byte offset of `col` chars into `line`. Clamps if the line is shorter.
+fn source_offset_for(s: &str, line: usize, col: usize) -> usize {
+    let start = source_line_start(s, line);
+    let end = source_line_end(s, line);
+    let line_str = &s[start..end];
+    let mut taken = 0usize;
+    let mut last = start;
+    for (i, _ch) in line_str.char_indices() {
+        if taken == col { return start + i; }
+        taken += 1;
+        last = start + i + line_str[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    last.min(end)
 }
 
 /// Cheap stat read; returns `None` if the file is gone or unstatable. Called
@@ -1189,6 +1464,106 @@ mod tests {
 
         // History still has the original root, so we're not "stuck".
         assert!(!app.history.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_mode_insert_marks_dirty_and_advances_cursor() {
+        let dir = fresh_temp("edit-insert");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "hello\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        app.edit_insert("X");
+
+        let View::Reader(r) = &app.view else { panic!("expected reader") };
+        assert_eq!(r.raw, "Xhello\n");
+        let e = r.edit.as_ref().unwrap();
+        assert!(e.dirty);
+        assert_eq!(e.cursor, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_save_persists_to_disk_and_clears_dirty() {
+        let dir = fresh_temp("edit-save");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "first\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        app.edit_insert("X");
+        app.save_edit().unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "Xfirst\n");
+        let View::Reader(r) = &app.view else { panic!() };
+        assert!(!r.edit.as_ref().unwrap().dirty);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_discard_reloads_from_disk_and_exits_edit_mode() {
+        let dir = fresh_temp("edit-discard");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "original\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        app.edit_insert("XYZ");
+        // Sanity: buffer was mutated.
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "XYZoriginal\n"),
+            _ => panic!(),
+        }
+        app.exit_edit_discard();
+
+        match &app.view {
+            View::Reader(r) => {
+                assert!(r.edit.is_none(), "should be back in view mode");
+                assert_eq!(r.raw, "original\n", "buffer should match disk");
+            }
+            _ => panic!(),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn block_level_raw_toggle_substitutes_only_cursor_block() {
+        let dir = fresh_temp("edit-toggle");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "# Heading\n\nSecond paragraph.\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        // Cursor at byte 0 → in the heading block.
+        app.ensure_rendered(80);
+
+        let View::Reader(r) = &app.view else { panic!() };
+        let rd = r.rendered.as_ref().unwrap();
+        // The heading line should be visible with its raw `#` marker since
+        // the cursor is in that block.
+        let any_raw_heading = rd.lines.iter().any(|l| {
+            let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            s.contains("# Heading")
+        });
+        assert!(any_raw_heading, "expected raw heading line in rendered output");
+
+        // The other paragraph should remain formatted (no `#` markers).
+        let any_raw_para_marker = rd.lines.iter().any(|l| {
+            let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            s.contains("# Second")
+        });
+        assert!(!any_raw_para_marker, "second paragraph should stay formatted");
 
         std::fs::remove_dir_all(&dir).ok();
     }

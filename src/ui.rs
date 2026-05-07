@@ -191,6 +191,24 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     }
     f.render_widget(Paragraph::new(display_lines), body_area);
     draw_scrollbar(f, scrollbar_area, scroll, total, visible_h, theme);
+
+    // Edit mode: paint the source cursor as a reverse-video cell on top of
+    // the body. Doing this *after* rendering the paragraph keeps the cursor
+    // visible regardless of the underlying span's foreground/background.
+    if let Some((cx, cy)) = rendered.cursor_xy {
+        let cy_view = cy as i32 - r.scroll as i32;
+        if cy_view >= 0 && (cy_view as u16) < body_area.height {
+            let row = body_area.y + cy_view as u16;
+            let col = body_area.x + cx;
+            if col < body_area.x + body_area.width {
+                let buf = f.buffer_mut();
+                let cell = &mut buf[(col, row)];
+                // Carry the existing cell's char so we don't overwrite the
+                // glyph the cursor is "on" — we just invert it.
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
 }
 
 /// Render any visible images in the document on top of the body, using the
@@ -524,16 +542,33 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     let right = Span::styled(format!(" {} ", scroll_pos), bg);
     let right_w = UnicodeWidthStr::width(right.content.as_ref());
 
-    // Left span: optional back button + path. Back button may be absent.
+    // Left span: edit-mode badge (if editing) OR optional back button +
+    // path. The edit badge takes precedence over Back so the user always
+    // knows they're in a mutating mode.
     let mut back_span: Option<Span> = None;
     app.back_button_hit = None;
-    if !app.history.is_empty() {
+    let edit_badge: Option<Span> = if let View::Reader(r) = &app.view {
+        r.edit.as_ref().map(|e| {
+            let label = if e.dirty { " EDIT* " } else { " EDIT " };
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .bg(theme.heading[0])
+                    .fg(theme.status_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
+    } else {
+        None
+    };
+    if edit_badge.is_none() && !app.history.is_empty() {
         let label = " ‹ Back ";
         let start_x = area.x;
         let end_x = area.x + label.chars().count() as u16;
         back_span = Some(Span::styled(label.to_string(), bg.add_modifier(Modifier::BOLD)));
         app.back_button_hit = Some((start_x, end_x));
     }
+    let left_badge = edit_badge.or(back_span);
 
     // Detect whether we should apply the bottom-row hover edge case: the
     // hovered link sits on the last body row, and the user's mouse is over it.
@@ -550,7 +585,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     match edge_swap {
         EdgeSwap::Right => {
             // URL pinned to the right of the row (just before scroll%).
-            push_left(&mut line_spans, &back_span, &path, path_style);
+            push_left(&mut line_spans, &left_badge, &path, path_style);
             let mid_styled = Span::styled(format!(" {} ", mid_text), middle.style(theme));
             let mid_w = UnicodeWidthStr::width(mid_styled.content.as_ref());
             let used = span_width(&line_spans) + mid_w + right_w;
@@ -560,7 +595,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
         EdgeSwap::Left => {
             // URL takes the left of the row, suppressing the path.
-            if let Some(b) = back_span.clone() { line_spans.push(b); line_spans.push(Span::raw(" ")); }
+            if let Some(b) = left_badge.clone() { line_spans.push(b); line_spans.push(Span::raw(" ")); }
             line_spans.push(Span::styled(format!(" {} ", mid_text), middle.style(theme)));
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
@@ -568,7 +603,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
         EdgeSwap::None => {
             // Default layout: [back] [path]   <middle>   <right>
-            push_left(&mut line_spans, &back_span, &path, path_style);
+            push_left(&mut line_spans, &left_badge, &path, path_style);
             if !mid_text.is_empty() {
                 let pad_left = 2usize;
                 let used_left = span_width(&line_spans) + pad_left;
@@ -621,10 +656,24 @@ impl Mid {
 }
 
 fn compute_middle(app: &App) -> Mid {
+    // Edit mode confirm-discard prompt overrides everything (including the
+    // status line — we want the user to act on the prompt before being
+    // distracted by anything else).
+    if let View::Reader(r) = &app.view {
+        if let Some(e) = r.edit.as_ref() {
+            if e.discard_pending {
+                return Mid::Status("Press Esc again to discard, any other key to cancel".into());
+            }
+        }
+    }
     if !app.status.is_empty() {
         return Mid::Status(app.status.clone());
     }
     if let View::Reader(r) = &app.view {
+        // Edit-mode hint replaces the normal viewer hint when active.
+        if r.edit.is_some() {
+            return Mid::Hint("type to edit  Ctrl-S save  Esc Esc discard".into());
+        }
         if let Some(s) = r.doc_search.as_ref() {
             let txt = if s.editing {
                 format!("/{}_", s.query)
@@ -747,7 +796,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  T                fuzzy file search"),
         Line::from("  h / b            history back"),
         Line::from("  l / f            history forward"),
-        Line::from("  e                edit current file in $EDITOR"),
+        Line::from("  e                enter in-house edit mode"),
+        Line::from("                   (Ctrl-S save, Ctrl-W save backup, Esc Esc discard)"),
         Line::from("  o                open focused link in browser"),
         Line::from("  m                toggle mouse capture (drag-to-select)"),
         Line::from("  q / Ctrl-C       quit"),
