@@ -596,22 +596,28 @@ mod scroll_damp_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn first_event_passes_through_at_full_strength() {
+    fn first_event_emits_one_line() {
+        // An isolated wheel tick (no recent previous event) should emit
+        // exactly one line, even though the raw delta from crossterm is 3.
         let mut last = None;
         let mut accum = 0.0;
         let d = compute_dampened_scroll(&mut last, &mut accum, 3, Instant::now());
-        assert_eq!(d, 3);
+        assert_eq!(d, 1);
     }
 
     #[test]
-    fn slow_scroll_keeps_full_speed() {
+    fn slow_scroll_emits_one_line_per_event() {
         let mut last = None;
         let mut accum = 0.0;
         let t0 = Instant::now();
-        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t0), 3);
-        // 250ms later — past the burst threshold; full delta passes through.
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t0), 1);
+        // 250ms later — past the burst threshold; deliberate ticks remain
+        // one-line-at-a-time so reading flow isn't jumpy.
         let t1 = t0 + Duration::from_millis(250);
-        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t1), 3);
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, 3, t1), 1);
+        // Negative direction also emits one line.
+        let t2 = t1 + Duration::from_millis(250);
+        assert_eq!(compute_dampened_scroll(&mut last, &mut accum, -3, t2), -1);
     }
 
     #[test]
@@ -777,15 +783,27 @@ fn wheel_scroll(app: &mut App, raw_delta: i32) {
 /// Pure dampening logic, factored out for tests. The `now` parameter lets
 /// callers feed deterministic timestamps. Updates `last_at` and `accum`
 /// in place; returns the integer-line delta to apply to scroll position.
+///
+/// Behaviour:
+/// - Deliberate / isolated wheel tick (>=200ms after the previous one) emits
+///   exactly one line in the requested direction, regardless of the raw
+///   wheel magnitude. Most terminals report a notch as a delta of 3, which
+///   feels jumpy when the user is reading line-by-line.
+/// - Rapid bursts (trackpad fling, momentum scroll) take a 0.5× factor and
+///   accumulate fractional credit so the page still moves at a reasonable
+///   speed, but doesn't fly off.
 fn compute_dampened_scroll(
     last_at: &mut Option<std::time::Instant>,
     accum: &mut f32,
     requested: i32,
     now: std::time::Instant,
 ) -> i32 {
+    if requested == 0 { return 0; }
+
     let elapsed_ms = last_at
         .map(|t| now.duration_since(t).as_millis() as u32)
         .unwrap_or(u32::MAX);
+
     // Long pause → drop fractional credit so a scroll started minutes ago
     // doesn't suddenly move an extra line on the next event.
     if elapsed_ms > 500 {
@@ -796,12 +814,21 @@ fn compute_dampened_scroll(
     if (*accum > 0.0 && requested < 0) || (*accum < 0.0 && requested > 0) {
         *accum = 0.0;
     }
-    // Linear ramp: ≤100ms apart → 0.5× (burst), ≥200ms → 1.0× (deliberate).
-    let factor = ((elapsed_ms as f32) / 200.0).clamp(0.5, 1.0);
+
+    *last_at = Some(now);
+
+    // Slow / deliberate path: one line per event. Skip the accumulator so
+    // a recent burst doesn't bleed extra lines into the next deliberate tick.
+    if elapsed_ms >= 200 {
+        *accum = 0.0;
+        return if requested > 0 { 1 } else { -1 };
+    }
+
+    // Burst path: half-strength with fractional carry.
+    let factor = 0.5_f32;
     *accum += (requested as f32) * factor;
     let lines = accum.trunc() as i32;
     *accum -= lines as f32;
-    *last_at = Some(now);
     lines
 }
 
