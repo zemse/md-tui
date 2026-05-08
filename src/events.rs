@@ -324,12 +324,25 @@ fn center_focus_or_top(app: &mut App) {
 /// from click position there.
 fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Ctrl-C is the hard escape hatch (handled above before we get here in
     // practice, but kept defensively in case dispatch shifts).
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         app.should_quit = true;
         return Ok(());
+    }
+
+    // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
+    // Delete on macOS, Ctrl-arrow / Ctrl-Backspace on Linux/Windows).
+    if alt || ctrl {
+        match key.code {
+            KeyCode::Left => { app.edit_move_word(-1); return Ok(()); }
+            KeyCode::Right => { app.edit_move_word(1); return Ok(()); }
+            KeyCode::Backspace => { app.edit_delete_word(false); return Ok(()); }
+            KeyCode::Delete => { app.edit_delete_word(true); return Ok(()); }
+            _ => {}
+        }
     }
 
     // Save: Ctrl-S primary, Ctrl-W backup (some terminals eat Ctrl-S as

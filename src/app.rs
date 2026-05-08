@@ -824,6 +824,51 @@ impl App {
         r.rendered = None;
     }
 
+    /// Move cursor by one word left/right. "Word" = run of non-whitespace,
+    /// matching macOS-native Alt-arrow semantics: skips through any
+    /// whitespace adjacent to the cursor, then through the next non-
+    /// whitespace run, landing on the far edge.
+    pub fn edit_move_word(&mut self, delta: i32) {
+        let View::Reader(r) = &mut self.view else { return };
+        let Some(e) = r.edit.as_mut() else { return };
+        e.discard_pending = false;
+        let pos = floor_char_boundary(&r.raw, e.cursor);
+        let new = if delta < 0 {
+            prev_word_boundary(&r.raw, pos)
+        } else {
+            next_word_boundary(&r.raw, pos)
+        };
+        if new != e.cursor {
+            e.cursor = new;
+            r.rendered = None;
+        }
+    }
+
+    /// Delete from the cursor to the next/previous word boundary.
+    /// `forward = true` deletes rightward (Alt-Delete), `false` deletes
+    /// leftward (Alt-Backspace). One undo snapshot per call.
+    pub fn edit_delete_word(&mut self, forward: bool) {
+        let View::Reader(r) = &mut self.view else { return };
+        if r.edit.is_none() { return; }
+        let cur = r.edit.as_ref().unwrap().cursor;
+        let pos = floor_char_boundary(&r.raw, cur);
+        let (from, to) = if forward {
+            let to = next_word_boundary(&r.raw, pos);
+            (pos, to)
+        } else {
+            let from = prev_word_boundary(&r.raw, pos);
+            (from, pos)
+        };
+        if from == to { return; }
+        push_undo(r);
+        r.raw.replace_range(from..to, "");
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = from;
+        e.dirty = true;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+
     /// Move cursor by one char left/right (`delta` ±1). Re-renders so the
     /// block-level toggle can swap blocks if the cursor crossed a boundary.
     pub fn edit_move_horizontal(&mut self, delta: i32) {
@@ -1286,6 +1331,43 @@ fn source_line_end(s: &str, line: usize) -> usize {
         .find('\n')
         .map(|i| start + i)
         .unwrap_or(s.len())
+}
+
+/// Byte offset of the next word boundary after `pos`. Skips through any
+/// whitespace, then through the next non-whitespace run, landing at the
+/// edge or `s.len()`. Matches macOS-native Alt-Right semantics.
+fn next_word_boundary(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    let mut i = pos;
+    let len = s.len();
+    while i < len {
+        let ch = s[i..].chars().next().unwrap();
+        if !ch.is_whitespace() { break; }
+        i += ch.len_utf8();
+    }
+    while i < len {
+        let ch = s[i..].chars().next().unwrap();
+        if ch.is_whitespace() { break; }
+        i += ch.len_utf8();
+    }
+    i
+}
+
+/// Byte offset of the previous word boundary before `pos`. Symmetric
+/// counterpart to `next_word_boundary`.
+fn prev_word_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos.min(s.len());
+    while i > 0 {
+        let prev = s[..i].chars().next_back().unwrap();
+        if !prev.is_whitespace() { break; }
+        i -= prev.len_utf8();
+    }
+    while i > 0 {
+        let prev = s[..i].chars().next_back().unwrap();
+        if prev.is_whitespace() { break; }
+        i -= prev.len_utf8();
+    }
+    i
 }
 
 /// Walk source[range] by display-column width and return the byte offset
