@@ -842,13 +842,33 @@ impl App {
         }
     }
 
-    /// Move the cursor up/down one source line, preserving column where
-    /// possible. Operates on `Reader::raw` directly (not the rendered grid)
-    /// so wrap doesn't confuse the up/down notion.
+    /// Move the cursor up/down one *display* row, so soft-wrapped lines
+    /// step row-by-row instead of jumping past the whole paragraph. Falls
+    /// back to source-line stepping when the target row is outside any
+    /// raw block (e.g. crossing into a formatted block — that block then
+    /// becomes raw on the next render and subsequent moves land precisely).
     pub fn edit_move_vertical(&mut self, delta: i32) {
         let View::Reader(r) = &mut self.view else { return };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
+
+        if let Some(rendered) = r.rendered.as_ref() {
+            if let Some((cur_col, cur_row)) = rendered.cursor_xy {
+                let target_row = (cur_row as i32 + delta).max(0) as usize;
+                if let Some(Some(range)) = rendered.row_source.get(target_row) {
+                    let new = source_offset_at_col(&r.raw, range, cur_col as usize);
+                    if new != e.cursor {
+                        e.cursor = new;
+                        r.rendered = None;
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Fallback: source-line stepping. Lands at the next/prev `\n`-
+        // delimited source line; the renderer will substitute that block
+        // raw on the next render so the user can keep navigating.
         let (line_idx, col) = source_line_col(&r.raw, e.cursor);
         let target_line = (line_idx as i32 + delta).max(0) as usize;
         let new = source_offset_for(&r.raw, target_line, col);
@@ -1266,6 +1286,24 @@ fn source_line_end(s: &str, line: usize) -> usize {
         .find('\n')
         .map(|i| start + i)
         .unwrap_or(s.len())
+}
+
+/// Walk source[range] by display-column width and return the byte offset
+/// where the cursor should land for `col` columns. Used by edit-mode
+/// vertical movement so a soft-wrapped paragraph steps display-row by
+/// display-row, not source-line by source-line.
+fn source_offset_at_col(s: &str, range: &std::ops::Range<usize>, col: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let Some(slice) = s.get(range.clone()) else { return range.start };
+    let mut taken = 0usize;
+    for (i, ch) in slice.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if taken + w > col {
+            return range.start + i;
+        }
+        taken += w;
+    }
+    range.end
 }
 
 /// Byte offset of `col` chars into `line`. Clamps if the line is shorter.

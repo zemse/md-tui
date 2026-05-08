@@ -893,10 +893,11 @@ mod word_tests {
     }
 }
 
-/// Map a display (line_idx, col) to a source byte offset, using the per-block
-/// info recorded during rendering. Only valid when the cursor's containing
-/// block is being shown raw (edit mode block-level toggle), since that's the
-/// only case where a display line corresponds 1:1 with a source line.
+/// Map a display (line_idx, col) to a source byte offset. Uses
+/// `row_source` (populated for raw-substituted edit-mode rows) to get an
+/// exact answer; falls back to "start of containing block" for formatted
+/// rows so the next render swaps that block to raw and the cursor lands
+/// in a sensible place.
 fn xy_to_source_offset(
     rendered: &crate::markdown::Rendered,
     source: &str,
@@ -904,35 +905,24 @@ fn xy_to_source_offset(
     col: usize,
 ) -> Option<usize> {
     use unicode_width::UnicodeWidthChar;
-    // Find the block that contains this line. If the cursor's current block
-    // is the one being shown raw, that's where the click should land. Other
-    // blocks are formatted, so clicking on them moves the cursor to the
-    // start of that block (then on the next render that block becomes raw).
+    if let Some(Some(range)) = rendered.row_source.get(line_idx) {
+        let slice = source.get(range.clone())?;
+        let mut taken = 0usize;
+        for (i, ch) in slice.char_indices() {
+            let w = ch.width().unwrap_or(0);
+            if taken + w > col {
+                return Some(range.start + i);
+            }
+            taken += w;
+        }
+        return Some(range.end);
+    }
+    // Formatted row: bytes don't map 1:1 with display columns, so jump
+    // to the start of the block. The next render makes this block raw,
+    // and a follow-up click can land precisely.
     let block = rendered.blocks.iter().find(|b| {
         line_idx >= b.display_start && line_idx < b.display_end
     })?;
-    let line_in_block = line_idx - block.display_start;
-    let block_src = source.get(block.source_range.clone())?;
-    // Find the n-th source line (separated by `\n`).
-    let mut byte = 0usize;
-    let mut idx = 0usize;
-    for line in block_src.split('\n') {
-        if idx == line_in_block {
-            // Walk chars until we accumulate `col` display width.
-            let mut taken_width = 0usize;
-            for (i, ch) in line.char_indices() {
-                let w = ch.width().unwrap_or(0);
-                if taken_width + w > col {
-                    return Some(block.source_range.start + byte + i);
-                }
-                taken_width += w;
-            }
-            // Click past end of line → land at end of this line.
-            return Some(block.source_range.start + byte + line.len());
-        }
-        byte += line.len() + 1; // +1 for the consumed `\n`
-        idx += 1;
-    }
     Some(block.source_range.start)
 }
 

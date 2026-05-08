@@ -28,6 +28,12 @@ pub struct Rendered {
     /// Cursor display position when rendered in edit mode. `None` outside
     /// edit mode.
     pub cursor_xy: Option<(u16, u16)>,
+    /// Per-display-row source byte range. `Some(range)` for rows in raw-
+    /// substituted blocks (the cursor's block in edit mode); `None` for
+    /// formatted rows where bytes don't map 1:1 with display columns. Used
+    /// by edit mode to convert mouse clicks and Up/Down keys into source
+    /// byte offsets in display-row space (which respects soft-wrap).
+    pub row_source: Vec<Option<std::ops::Range<usize>>>,
 }
 
 /// Source-byte range + display-line range for one block. `display_start`/
@@ -124,7 +130,14 @@ enum Block {
     /// true for the synthetic raw block produced by edit-mode substitution:
     /// it skips the 2-col left pad and code background so the on-screen
     /// content lines up with the view-mode rendering of the same source.
-    Pre { lines: Vec<Vec<Run>>, prefix: Vec<Run>, flat: bool },
+    /// `line_sources[i]` is the source byte range for `lines[i]` when this
+    /// is an edit-mode raw substitution; empty for real code fences.
+    Pre {
+        lines: Vec<Vec<Run>>,
+        prefix: Vec<Run>,
+        flat: bool,
+        line_sources: Vec<Option<std::ops::Range<usize>>>,
+    },
     /// Table — column-aligned with box-drawing borders.
     Table {
         alignments: Vec<Alignment>,
@@ -583,7 +596,7 @@ impl Builder {
                     .collect();
                 let prefix = self.quote_prefix();
                 self.code_content.clear();
-                self.push_block(Block::Pre { lines, prefix, flat: false }, range);
+                self.push_block(Block::Pre { lines, prefix, flat: false, line_sources: Vec::new() }, range);
                 self.push_blank();
             }
             TagEnd::List(_) => {
@@ -811,6 +824,7 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
     let inner_width = width.max(1);
 
     let mut lines: Vec<Vec<Run>> = Vec::new();
+    let mut line_sources: Vec<Option<std::ops::Range<usize>>> = Vec::new();
     let mut byte_idx = 0usize;
     for line in slice.split('\n') {
         let line_len = line.len();
@@ -840,13 +854,19 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
             } else {
                 lines.push(vec![Run { text: chunk_text, style, link: None, checkbox: None, image: None, inline_range: None, cursor_at }]);
             }
+            // Source byte range covered by this display row, in `source`
+            // coordinates. Edit mode uses this to map clicks/cursor moves
+            // between display columns and source bytes.
+            let src_start = range.start + chunk_block_start;
+            let src_end = range.start + chunk_block_end;
+            line_sources.push(Some(src_start..src_end));
         }
         byte_idx += line_len + 1; // consumed `\n`
     }
     // Render with no left-pad / quote-bar prefix so the raw text aligns to
     // column 0 — that lets the cursor display position math match the
     // source-line column directly.
-    Block::Pre { lines, prefix: Vec::new(), flat: true }
+    Block::Pre { lines, prefix: Vec::new(), flat: true, line_sources }
 }
 
 fn heading_idx(l: HeadingLevel) -> usize {
@@ -875,6 +895,7 @@ fn layout(
     edit: Option<EditCtx>,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
+    let mut row_source: Vec<Option<std::ops::Range<usize>>> = Vec::new();
     let mut out_links: Vec<LinkSpan> = Vec::new();
     let mut out_checkboxes: Vec<CheckboxSpan> = Vec::new();
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
@@ -941,14 +962,14 @@ fn layout(
             Block::Table { alignments, header, rows } => {
                 layout_table(theme, &alignments, &header, &rows, width, &mut out_lines, &mut out_links, &links);
             }
-            Block::Pre { lines, prefix, flat } => {
+            Block::Pre { lines, prefix, flat, line_sources } => {
                 // Flat = edit-mode raw substitution: skip the 2-col left pad
                 // and code background so the rendered output lines up
                 // visually with view-mode formatting of the same source.
                 let pad_left = if flat { "" } else { "  " };
                 let prefix_width = prefix.iter().map(|r| r.text.width()).sum::<usize>() + pad_left.width();
                 let bg = if flat { None } else { theme.code_bg };
-                for line_runs in lines {
+                for (i, line_runs) in lines.into_iter().enumerate() {
                     let line_y = out_lines.len() as u16;
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     for r in &prefix {
@@ -985,9 +1006,19 @@ fn layout(
                         ));
                     }
                     out_lines.push(Line::from(spans));
+                    // Edit-mode raw rows expose source-byte mapping so clicks
+                    // and Up/Down keys respect soft-wrap; everything else is
+                    // formatted and stays None.
+                    let src = if flat {
+                        line_sources.get(i).cloned().unwrap_or(None)
+                    } else { None };
+                    row_source.push(src);
                 }
             }
         }
+        // Pad row_source so it stays parallel to out_lines for blocks that
+        // don't fill it themselves.
+        while row_source.len() < out_lines.len() { row_source.push(None); }
         let block_end_line = out_lines.len();
         if !block_source_range.is_empty() {
             block_infos.push(BlockInfo {
@@ -1022,6 +1053,7 @@ fn layout(
         width: width as u16,
         blocks: block_infos,
         cursor_xy,
+        row_source,
     }
 }
 
