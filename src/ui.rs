@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{self, App, BrowserEntryKind, DiffRowKind, Focus, View};
+use crate::app::{self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, View};
 use crate::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -70,11 +70,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_git_lens(f, app, body);
     } else {
         match &app.view {
-            View::Reader(_) => draw_reader(f, app, body),
+            View::Reader(r) => {
+                let split_edit = r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false);
+                if split_edit {
+                    draw_edit_split(f, app, body);
+                } else {
+                    draw_reader(f, app, body);
+                }
+            }
             View::Browser(_) => draw_browser(f, app, body),
         }
         if matches!(app.view, View::Reader(_)) {
-            draw_images_overlay(f, app, body);
+            // Image rendering is read-only; in split-edit mode we still
+            // show images in the preview pane area but the layout below
+            // wires its own rect, so the global overlay is suppressed.
+            let in_split = matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false));
+            if !in_split {
+                draw_images_overlay(f, app, body);
+            }
         }
     }
 
@@ -232,6 +245,154 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
                 cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+}
+
+/// Render split-screen edit mode: raw editor on the left (or top on
+/// narrow terminals), rendered preview on the right (or bottom). Both
+/// panes get a labeled header row; the focused pane (always the raw
+/// editor for now since that's where the cursor lives) is highlighted.
+fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
+    let View::Reader(r) = &app.view else { return; };
+    let theme = &app.opts.theme;
+    let Some(rendered) = r.rendered.as_ref() else { return; };
+
+    // Layout choice: side-by-side at >= 100 cols, vertical stack below.
+    let horizontal = area.width >= 100;
+    let (raw_area, preview_area, _split_dir) = if horizontal {
+        let half = area.width / 2;
+        let raw = Rect { x: area.x, y: area.y, width: half, height: area.height };
+        let prev = Rect {
+            x: area.x + half + 1,
+            y: area.y,
+            width: area.width.saturating_sub(half + 1),
+            height: area.height,
+        };
+        // Draw the vertical separator column.
+        let sep = Rect { x: area.x + half, y: area.y, width: 1, height: area.height };
+        let sep_style = Style::default().fg(theme.muted);
+        let sep_lines: Vec<Line> = (0..sep.height)
+            .map(|_| Line::from(Span::styled("│", sep_style)))
+            .collect();
+        f.render_widget(Paragraph::new(sep_lines), sep);
+        (raw, prev, "h")
+    } else {
+        let half = area.height / 2;
+        let raw = Rect { x: area.x, y: area.y, width: area.width, height: half };
+        let prev = Rect {
+            x: area.x,
+            y: area.y + half + 1,
+            width: area.width,
+            height: area.height.saturating_sub(half + 1),
+        };
+        let sep = Rect { x: area.x, y: area.y + half, width: area.width, height: 1 };
+        let sep_style = Style::default().fg(theme.muted);
+        let bar = "─".repeat(sep.width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(bar, sep_style))),
+            sep,
+        );
+        (raw, prev, "v")
+    };
+
+    app.edit_raw_area = raw_area;
+    app.edit_preview_area = preview_area;
+
+    // ---- Raw pane ----
+    let raw_rows = app::render_raw_pane(&r.raw, raw_area.width as usize);
+    let cursor = r.edit.as_ref().map(|e| e.cursor).unwrap_or(0);
+    let cur_row_idx = app::raw_row_for_cursor(&raw_rows, cursor);
+    let cur_col = if let Some(row) = raw_rows.get(cur_row_idx) {
+        app::raw_col_for_cursor(&r.raw, row, cursor)
+    } else { 0 };
+
+    // Auto-scroll raw pane so cursor is visible.
+    let visible_h_raw = raw_area.height as usize;
+    let mut raw_scroll = r.scroll as usize;
+    if cur_row_idx < raw_scroll { raw_scroll = cur_row_idx; }
+    if visible_h_raw > 0 && cur_row_idx >= raw_scroll + visible_h_raw {
+        raw_scroll = cur_row_idx + 1 - visible_h_raw;
+    }
+    let max_raw_scroll = raw_rows.len().saturating_sub(visible_h_raw);
+    if raw_scroll > max_raw_scroll { raw_scroll = max_raw_scroll; }
+
+    let raw_text_style = Style::default();
+    let mut raw_lines: Vec<Line> = Vec::with_capacity(visible_h_raw);
+    for i in 0..visible_h_raw {
+        let idx = raw_scroll + i;
+        if idx >= raw_rows.len() { break; }
+        let text = raw_rows[idx].text.clone();
+        // Soft heading hint: dim leading "#" for header lines.
+        let style = if text.trim_start().starts_with('#') {
+            Style::default().fg(theme.heading[0]).add_modifier(Modifier::BOLD)
+        } else if text.trim_start().starts_with('>') {
+            Style::default().fg(theme.quote)
+        } else if text.trim_start().starts_with("- ")
+            || text.trim_start().starts_with("* ")
+            || text.trim_start().starts_with(|c: char| c.is_ascii_digit())
+        {
+            raw_text_style
+        } else {
+            raw_text_style
+        };
+        raw_lines.push(Line::from(Span::styled(text, style)));
+    }
+    f.render_widget(Paragraph::new(raw_lines), raw_area);
+
+    // Cursor: reverse-video cell at (cur_col, cur_row_idx - raw_scroll).
+    let cy_view = cur_row_idx as i32 - raw_scroll as i32;
+    if cy_view >= 0 && (cy_view as u16) < raw_area.height {
+        let row = raw_area.y + cy_view as u16;
+        let col = raw_area.x + cur_col;
+        if col < raw_area.x + raw_area.width {
+            let buf = f.buffer_mut();
+            let cell = &mut buf[(col, row)];
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+    }
+
+    // ---- Preview pane ----
+    // Sync preview to follow cursor block (cursor-anchored half of the
+    // bidirectional sync; wheel-driven sync lives in the events layer).
+    let preview_target = app::preview_row_for_source(rendered, cursor);
+    let visible_h_prev = preview_area.height as usize;
+    let mut prev_scroll = r.preview_scroll as usize;
+    // Pull the preview to keep the cursor's block visible. We don't snap
+    // to the very top — only adjust when the target is off-screen.
+    if preview_target < prev_scroll { prev_scroll = preview_target; }
+    if visible_h_prev > 0 && preview_target >= prev_scroll + visible_h_prev {
+        prev_scroll = preview_target + 1 - visible_h_prev;
+    }
+    let max_prev_scroll = rendered.lines.len().saturating_sub(visible_h_prev);
+    if prev_scroll > max_prev_scroll { prev_scroll = max_prev_scroll; }
+
+    let mut prev_lines: Vec<Line> = Vec::with_capacity(visible_h_prev);
+    for i in 0..visible_h_prev {
+        let idx = prev_scroll + i;
+        if idx >= rendered.lines.len() { break; }
+        prev_lines.push(rendered.lines[idx].clone());
+    }
+    f.render_widget(Paragraph::new(prev_lines), preview_area);
+
+    // Highlight the row in the preview that corresponds to the cursor's
+    // block, as a subtle reverse-video bar at the start of the row. Helps
+    // the user see where their cursor is in the rendered output.
+    let cy_prev = preview_target as i32 - prev_scroll as i32;
+    if cy_prev >= 0 && (cy_prev as u16) < preview_area.height {
+        let row = preview_area.y + cy_prev as u16;
+        let buf = f.buffer_mut();
+        if preview_area.width > 0 {
+            let cell = &mut buf[(preview_area.x, row)];
+            cell.set_char('▎');
+            cell.set_style(Style::default().fg(theme.heading[0]));
+        }
+    }
+
+    // Persist scroll positions back to the reader so wheel handlers can
+    // build on them.
+    if let View::Reader(r) = &mut app.view {
+        r.scroll = raw_scroll as u16;
+        r.preview_scroll = prev_scroll as u16;
     }
 }
 
@@ -749,7 +910,7 @@ fn compute_middle(app: &App) -> Mid {
     if let View::Reader(r) = &app.view {
         // Edit-mode hint replaces the normal viewer hint when active.
         if r.edit.is_some() {
-            return Mid::Hint("type to edit  Ctrl-S save  Ctrl-Z undo  Esc Esc discard".into());
+            return Mid::Hint("type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc Esc discard".into());
         }
         if let Some(s) = r.doc_search.as_ref() {
             let txt = if s.editing {
@@ -873,9 +1034,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  T                fuzzy file search"),
         Line::from("  h / b            history back"),
         Line::from("  l / f            history forward"),
-        Line::from("  e                enter in-house edit mode"),
-        Line::from("                   (Ctrl-S save, Ctrl-W save backup, Esc Esc discard)"),
-        Line::from("                   Ctrl-Z undo, Ctrl-Y/Ctrl-R redo"),
+        Line::from("  e                edit mode (split: raw + preview, scroll-synced)"),
+        Line::from("                   Ctrl-S save  Ctrl-Z undo  Esc Esc discard"),
+        Line::from("                   Alt-←/→ word jump  Alt-Bksp/Del word delete"),
         Line::from("  Ctrl-G            git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  o                open focused link in browser"),
         Line::from("  m                toggle mouse capture (drag-to-select)"),

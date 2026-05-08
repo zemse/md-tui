@@ -565,6 +565,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         return Ok(());
     }
     let area = app.viewport;
+    // Split-screen edit mode owns the body: route by pane.
+    if in_split_edit(app) {
+        return handle_split_mouse(app, m);
+    }
     if !point_in(area, m.column, m.row) {
         match m.kind {
             MouseEventKind::ScrollUp => wheel_scroll(app, -3),
@@ -658,6 +662,127 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// True when the active reader is in split-screen edit mode.
+fn in_split_edit(app: &App) -> bool {
+    matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.mode == crate::app::EditMode::Split).unwrap_or(false))
+}
+
+/// Mouse routing for split-screen edit. Wheel in either pane scrolls that
+/// pane and syncs the other via block anchors (the bidirectional sync the
+/// user picked). Click in the raw pane sets the source cursor; click in
+/// the preview pane jumps the cursor to the corresponding source byte.
+fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+    let raw_area = app.edit_raw_area;
+    let prev_area = app.edit_preview_area;
+    let in_raw = point_in(raw_area, m.column, m.row);
+    let in_prev = point_in(prev_area, m.column, m.row);
+    match m.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let dir = if matches!(m.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+            let now = std::time::Instant::now();
+            let dampened = compute_dampened_scroll(
+                &mut app.last_scroll_at,
+                &mut app.scroll_accum,
+                dir * 3,
+                now,
+            );
+            if dampened == 0 { return Ok(()); }
+            if in_prev {
+                split_scroll_preview(app, dampened);
+            } else {
+                // Default + raw: scroll the raw pane (cursor side).
+                split_scroll_raw(app, dampened);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if in_raw {
+                split_click_raw(app, m.column, m.row);
+            } else if in_prev {
+                split_click_preview(app, m.column, m.row);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Scroll the raw pane by `delta` rows, clamping to the wrapped row count
+/// and re-syncing the preview to follow the new top-of-raw block.
+fn split_scroll_raw(app: &mut App, delta: i32) {
+    let raw_w = app.edit_raw_area.width.max(1) as usize;
+    let raw_h = app.edit_raw_area.height as usize;
+    let prev_h = app.edit_preview_area.height as usize;
+    let View::Reader(r) = &mut app.view else { return };
+    let rows = crate::app::render_raw_pane(&r.raw, raw_w);
+    let max = rows.len().saturating_sub(raw_h.max(1)) as i32;
+    let new = (r.scroll as i32 + delta).clamp(0, max) as u16;
+    r.scroll = new;
+    // Sync preview: anchor on the source byte at top of raw pane.
+    if let Some(top_row) = rows.get(new as usize) {
+        let src = top_row.source_range.start;
+        if let Some(rendered) = r.rendered.as_ref() {
+            let prev_row = crate::app::preview_row_for_source(rendered, src);
+            let max_prev = rendered.lines.len().saturating_sub(prev_h.max(1)) as u16;
+            r.preview_scroll = (prev_row as u16).min(max_prev);
+        }
+    }
+}
+
+/// Scroll the preview pane by `delta` rows; sync raw pane to follow.
+fn split_scroll_preview(app: &mut App, delta: i32) {
+    let raw_w = app.edit_raw_area.width.max(1) as usize;
+    let raw_h = app.edit_raw_area.height as usize;
+    let prev_h = app.edit_preview_area.height as usize;
+    let View::Reader(r) = &mut app.view else { return };
+    let Some(rendered) = r.rendered.as_ref() else { return };
+    let max_prev = rendered.lines.len().saturating_sub(prev_h.max(1)) as i32;
+    let new = (r.preview_scroll as i32 + delta).clamp(0, max_prev) as u16;
+    r.preview_scroll = new;
+    // Sync raw pane: source byte at top-of-preview → raw row.
+    let src = crate::app::source_for_preview_row(rendered, new as usize);
+    let rows = crate::app::render_raw_pane(&r.raw, raw_w);
+    let raw_row = crate::app::raw_row_for_cursor(&rows, src);
+    let max_raw = rows.len().saturating_sub(raw_h.max(1)) as u16;
+    r.scroll = (raw_row as u16).min(max_raw);
+}
+
+/// Set the source cursor from a click in the raw pane.
+fn split_click_raw(app: &mut App, col: u16, row: u16) {
+    let raw_w = app.edit_raw_area.width.max(1) as usize;
+    let area = app.edit_raw_area;
+    if !point_in(area, col, row) { return; }
+    let local_row = (row - area.y) as usize + match &app.view {
+        View::Reader(r) => r.scroll as usize,
+        _ => 0,
+    };
+    let local_col = (col - area.x) as usize;
+    let View::Reader(r) = &mut app.view else { return };
+    let rows = crate::app::render_raw_pane(&r.raw, raw_w);
+    let new_cursor = crate::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
+    if let Some(e) = r.edit.as_mut() {
+        e.cursor = new_cursor;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
+}
+
+/// Click in the preview pane: jump source cursor to that block's start.
+/// Useful for navigating to a section by clicking the rendered headline.
+fn split_click_preview(app: &mut App, col: u16, row: u16) {
+    let area = app.edit_preview_area;
+    if !point_in(area, col, row) { return; }
+    let View::Reader(r) = &mut app.view else { return };
+    let Some(rendered) = r.rendered.as_ref() else { return };
+    let local_row = (row - area.y) as usize + r.preview_scroll as usize;
+    let _ = col;
+    let new_cursor = crate::app::source_for_preview_row(rendered, local_row);
+    if let Some(e) = r.edit.as_mut() {
+        e.cursor = new_cursor;
+        e.discard_pending = false;
+        r.rendered = None;
+    }
 }
 
 /// Convert a screen (col, row) to a body-local (line_index, display_col).

@@ -91,6 +91,11 @@ pub struct App {
     pub image_picker: Option<Picker>,
     /// Lazily-decoded image protocol cache, keyed by canonicalised path.
     pub image_protocols: HashMap<PathBuf, StatefulProtocol>,
+    /// Raw-pane and preview-pane rects from the last frame in split-edit
+    /// mode. Used by event routing (which pane received the click / wheel).
+    /// Both default to `Rect::default()` outside split-edit mode.
+    pub edit_raw_area: Rect,
+    pub edit_preview_area: Rect,
 }
 
 pub enum View {
@@ -118,19 +123,32 @@ pub struct Reader {
     pub raw: String,
     pub rendered: Option<Rendered>,
     pub scroll: u16,
+    /// In split-screen edit mode this is the preview-pane scroll (right /
+    /// bottom side); the raw pane scroll lives on `Reader::scroll`.
+    pub preview_scroll: u16,
     /// Unified keyboard cursor. Walks links AND checkboxes in document order
     /// via Tab / S-Tab. Suppressed visually while the mouse is recent.
     pub focus: Option<Focus>,
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
     pub doc_search: Option<DocSearch>,
-    /// In-house edit mode. `Some` while the user is editing this buffer
-    /// in-place (entered via `e`, exited via Esc-Esc).
+    /// In-house edit mode. `Some` while the user is editing this buffer.
     pub edit: Option<EditState>,
     /// (mtime, size) snapshot of the source file at last read. Used by the
     /// event loop to detect external edits and reload. `None` for stdin or
     /// when the metadata wasn't available at load time.
     pub last_meta: Option<(std::time::SystemTime, u64)>,
+}
+
+/// Default-active edit-mode UI. `Split` is the new HackMD-style two-pane
+/// editor (raw on one side, rendered preview on the other). `InPlace` is
+/// the legacy block-toggle mode — kept compiled but inactive so we can
+/// reactivate it later without rewriting from scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditMode {
+    Split,
+    #[allow(dead_code)]
+    InPlace,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +168,8 @@ pub struct EditState {
     /// Redo stack: snapshots popped from undo after a Ctrl-Z. Cleared on
     /// any new mutation (since the future timeline diverged).
     pub redo: Vec<EditSnapshot>,
+    /// Which UI flavor to render. New edits start `Split`.
+    pub mode: EditMode,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +355,8 @@ impl App {
             last_scroll_at: None,
             image_picker: None,
             image_protocols: HashMap::new(),
+            edit_raw_area: Rect::default(),
+            edit_preview_area: Rect::default(),
         })
     }
 
@@ -701,8 +723,11 @@ impl App {
                 discard_pending: false,
                 undo: Vec::new(),
                 redo: Vec::new(),
+                mode: EditMode::Split,
             });
             r.rendered = None;
+            r.scroll = 0;
+            r.preview_scroll = 0;
             self.status.clear();
         }
     }
@@ -887,16 +912,42 @@ impl App {
         }
     }
 
-    /// Move the cursor up/down one *display* row, so soft-wrapped lines
-    /// step row-by-row instead of jumping past the whole paragraph. Falls
-    /// back to source-line stepping when the target row is outside any
-    /// raw block (e.g. crossing into a formatted block — that block then
-    /// becomes raw on the next render and subsequent moves land precisely).
+    /// Move the cursor up/down one *display* row in whichever pane owns the
+    /// cursor (raw pane in split mode; the cursor's block in legacy in-place
+    /// mode). Falls back to source-line stepping if the target row is out
+    /// of range.
     pub fn edit_move_vertical(&mut self, delta: i32) {
+        // Split-mode: walk the raw-pane wrap.
+        let split_mode = matches!(
+            &self.view,
+            View::Reader(r) if r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false)
+        );
+        if split_mode {
+            let raw_w = self.edit_raw_area.width.max(1) as usize;
+            let View::Reader(r) = &mut self.view else { return };
+            let Some(e) = r.edit.as_mut() else { return };
+            e.discard_pending = false;
+            let cursor = e.cursor;
+            let rows = render_raw_pane(&r.raw, raw_w);
+            let cur_idx = raw_row_for_cursor(&rows, cursor);
+            let target_idx = (cur_idx as i32 + delta).max(0) as usize;
+            let target_idx = target_idx.min(rows.len().saturating_sub(1));
+            let cur_col = rows.get(cur_idx)
+                .map(|row| raw_col_for_cursor(&r.raw, row, cursor))
+                .unwrap_or(0) as usize;
+            let new = raw_click_to_source(&rows, &r.raw, target_idx, cur_col);
+            if new != e.cursor {
+                e.cursor = new;
+                r.rendered = None;
+            }
+            return;
+        }
+
+        // Legacy InPlace mode: step display rows of the active raw block,
+        // falling back to source-line stepping when crossing block bounds.
         let View::Reader(r) = &mut self.view else { return };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
-
         if let Some(rendered) = r.rendered.as_ref() {
             if let Some((cur_col, cur_row)) = rendered.cursor_xy {
                 let target_row = (cur_row as i32 + delta).max(0) as usize;
@@ -910,10 +961,6 @@ impl App {
                 }
             }
         }
-
-        // Fallback: source-line stepping. Lands at the next/prev `\n`-
-        // delimited source line; the renderer will substitute that block
-        // raw on the next render so the user can keep navigating.
         let (line_idx, col) = source_line_col(&r.raw, e.cursor);
         let target_line = (line_idx as i32 + delta).max(0) as usize;
         let new = source_offset_for(&r.raw, target_line, col);
@@ -923,8 +970,33 @@ impl App {
         }
     }
 
-    /// Move cursor to start (`bol`) or end (`eol`) of current source line.
+    /// Move cursor to start (`bol=false`) or end (`eol=true`) of the current
+    /// display row in the raw pane (split mode) or current source line
+    /// (legacy in-place mode).
     pub fn edit_move_line_edge(&mut self, eol: bool) {
+        let split_mode = matches!(
+            &self.view,
+            View::Reader(r) if r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false)
+        );
+        if split_mode {
+            let raw_w = self.edit_raw_area.width.max(1) as usize;
+            let View::Reader(r) = &mut self.view else { return };
+            let Some(e) = r.edit.as_mut() else { return };
+            e.discard_pending = false;
+            let rows = render_raw_pane(&r.raw, raw_w);
+            let cur_idx = raw_row_for_cursor(&rows, e.cursor);
+            let new = if let Some(row) = rows.get(cur_idx) {
+                if eol { row.source_range.end } else { row.source_range.start }
+            } else {
+                e.cursor
+            };
+            if new != e.cursor {
+                e.cursor = new;
+                r.rendered = None;
+            }
+            return;
+        }
+
         let View::Reader(r) = &mut self.view else { return };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
@@ -960,18 +1032,14 @@ impl App {
 
     /// Re-render reader if width or edit-mode cursor changed since last
     /// render. Edit mode bypasses the cached render whenever the cursor
-    /// has moved into a different block, since the block-level toggle
-    /// changes the displayed content.
+    /// has moved (in-place mode) or whenever the buffer differs from
+    /// the last render's source (split mode rebuilds the preview each
+    /// frame; the renderer is fast enough at TUI file sizes).
     pub fn ensure_rendered(&mut self, width: u16) {
         let theme = self.opts.theme.clone();
         let user_width = self.opts.width;
         let target_w = if user_width == 0 { width } else { user_width.min(width) };
         if let View::Reader(r) = &mut self.view {
-            // Edit mode invalidates cache aggressively. The renderer is fast
-            // enough at the file sizes a TUI reader handles that re-running
-            // it on every keystroke is acceptable; we can add an
-            // "invalidate-only-when-cursor-crosses-block" optimisation later
-            // if we measure pain.
             let needs = match &r.rendered {
                 Some(rd) => rd.width != target_w || r.edit.is_some(),
                 None => true,
@@ -981,7 +1049,15 @@ impl App {
                     ReaderOrigin::File(p) => p.parent().map(|p| p.to_path_buf()),
                     ReaderOrigin::Stdin => None,
                 };
-                let edit_ctx = r.edit.as_ref().map(|e| markdown::EditCtx { cursor: e.cursor });
+                // In split-screen edit mode the preview pane shows the fully
+                // formatted markdown — no in-place block toggle. The cursor
+                // lives in the raw pane only. In legacy InPlace mode (kept
+                // for future) we still pass the cursor so the cursor's
+                // block renders raw.
+                let edit_ctx = r.edit.as_ref().and_then(|e| match e.mode {
+                    EditMode::Split => None,
+                    EditMode::InPlace => Some(markdown::EditCtx { cursor: e.cursor }),
+                });
                 r.rendered = Some(markdown::render_with_edit(
                     &r.raw,
                     base_dir.as_deref(),
@@ -991,7 +1067,11 @@ impl App {
                 ));
                 if let Some(rd) = &r.rendered {
                     let max_scroll = rd.lines.len().saturating_sub(1) as u16;
-                    if r.scroll > max_scroll { r.scroll = max_scroll; }
+                    if r.preview_scroll > max_scroll { r.preview_scroll = max_scroll; }
+                    // In split mode `r.scroll` is the raw-pane scroll; raw
+                    // wrap is computed at draw time so we can't clamp here.
+                    let in_split = r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false);
+                    if !in_split && r.scroll > max_scroll { r.scroll = max_scroll; }
                 }
             }
         }
@@ -1152,6 +1232,7 @@ impl Reader {
             raw,
             rendered: None,
             scroll: 0,
+            preview_scroll: 0,
             focus: None,
             hover_link: None,
             hover_checkbox: None,
@@ -1192,6 +1273,7 @@ impl Reader {
             raw,
             rendered: None,
             scroll: 0,
+            preview_scroll: 0,
             focus: None,
             hover_link: None,
             hover_checkbox: None,
@@ -1331,6 +1413,158 @@ fn source_line_end(s: &str, line: usize) -> usize {
         .find('\n')
         .map(|i| start + i)
         .unwrap_or(s.len())
+}
+
+// ---------------------------------------------------------------------------
+// Split-screen edit mode: raw-pane rendering and pane-to-pane scroll sync.
+// ---------------------------------------------------------------------------
+
+/// One wrapped row of the raw pane. Pure plain text plus the source byte
+/// range it covers, so click→cursor and cursor→display-row mappings are
+/// trivial in either direction.
+#[derive(Clone, Debug)]
+pub struct RawRow {
+    pub text: String,
+    pub source_range: std::ops::Range<usize>,
+}
+
+/// Wrap `raw` to `width` columns, producing one `RawRow` per display row.
+/// Splits on `\n` first (preserving the implicit empty row at the end of
+/// the buffer so the cursor can land just after a trailing newline), then
+/// soft-wraps each source line via the same word-aware wrapper used by
+/// the markdown renderer.
+pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
+    let mut rows: Vec<RawRow> = Vec::new();
+    let inner_width = width.max(1);
+    let mut byte = 0usize;
+    // Iterate `\n`-delimited source lines; `split('\n')` yields the trailing
+    // empty if `raw` ends with `\n`, which gives us the empty row at EOF.
+    let mut lines: Vec<&str> = raw.split('\n').collect();
+    if raw.is_empty() { lines = vec![""]; }
+    for (i, line) in lines.iter().enumerate() {
+        let line_start = byte;
+        let line_len = line.len();
+        let stripped = line.strip_suffix('\r').unwrap_or(line);
+        let chunks = markdown::wrap_to_width_pub(stripped, inner_width);
+        let chunks: Vec<(std::ops::Range<usize>, String)> = if chunks.is_empty() {
+            vec![(0..0, String::new())]
+        } else {
+            chunks
+        };
+        for (chunk_range, chunk_text) in chunks {
+            let src_start = line_start + chunk_range.start;
+            let src_end = line_start + chunk_range.end;
+            rows.push(RawRow {
+                text: chunk_text,
+                source_range: src_start..src_end,
+            });
+        }
+        // Advance past `\n` between lines (but not after the last entry,
+        // which terminates the iteration cleanly).
+        if i + 1 < lines.len() {
+            byte = line_start + line_len + 1;
+        } else {
+            byte = line_start + line_len;
+        }
+    }
+    rows
+}
+
+/// Find the raw-pane row index containing `cursor` (or the last row when
+/// the cursor sits at EOF).
+pub fn raw_row_for_cursor(rows: &[RawRow], cursor: usize) -> usize {
+    if rows.is_empty() { return 0; }
+    for (i, row) in rows.iter().enumerate() {
+        // A cursor on the boundary between two rows belongs to the *next*
+        // row when there's a wrap-break (no `\n`); but the first row that
+        // spans `cursor` works for both wrapped and `\n`-delimited cases
+        // because the previous row's `source_range.end` equals the next
+        // row's `source_range.start`.
+        if cursor >= row.source_range.start && cursor <= row.source_range.end {
+            // Prefer the *first* row containing the position when at a
+            // boundary, except at end of the row when the next row starts
+            // at the same position (wrap break) — then bump to the next.
+            let at_end = cursor == row.source_range.end;
+            let next_starts_here = rows.get(i + 1)
+                .map(|nr| nr.source_range.start == cursor)
+                .unwrap_or(false);
+            if at_end && next_starts_here {
+                return i + 1;
+            }
+            return i;
+        }
+    }
+    rows.len() - 1
+}
+
+/// Display column of `cursor` within its row. Walks the row's source slice
+/// by char width.
+pub fn raw_col_for_cursor(raw: &str, row: &RawRow, cursor: usize) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    let start = row.source_range.start;
+    let end = row.source_range.end.min(cursor);
+    if cursor < start { return 0; }
+    let slice = match raw.get(start..end) {
+        Some(s) => s,
+        None => return 0,
+    };
+    slice.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() as u16
+}
+
+/// Map a (row, col) click in the raw pane to a source byte offset.
+pub fn raw_click_to_source(rows: &[RawRow], raw: &str, row: usize, col: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let Some(r) = rows.get(row) else {
+        return rows.last().map(|x| x.source_range.end).unwrap_or(0);
+    };
+    let slice = raw.get(r.source_range.clone()).unwrap_or("");
+    let mut taken = 0usize;
+    for (i, ch) in slice.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if taken + w > col { return r.source_range.start + i; }
+        taken += w;
+    }
+    r.source_range.end
+}
+
+/// Map a source byte offset to a preview-pane row index. Uses
+/// `Rendered::blocks` for block-level alignment, then linearly interpolates
+/// inside the block by source position.
+pub fn preview_row_for_source(rendered: &Rendered, cursor: usize) -> usize {
+    // Find the block whose source range contains the cursor.
+    for b in &rendered.blocks {
+        if cursor >= b.source_range.start && cursor < b.source_range.end {
+            let span = b.source_range.end.saturating_sub(b.source_range.start).max(1);
+            let off = cursor.saturating_sub(b.source_range.start);
+            let h = b.display_end.saturating_sub(b.display_start);
+            let row_in_block = (off * h) / span;
+            return b.display_start + row_in_block;
+        }
+    }
+    // Fall back: nearest block at or before the cursor.
+    let mut best: usize = 0;
+    for b in &rendered.blocks {
+        if b.source_range.start <= cursor {
+            best = b.display_end.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+/// Reverse of `preview_row_for_source`: given a preview row, find a
+/// representative source byte offset for the block containing that row.
+pub fn source_for_preview_row(rendered: &Rendered, row: usize) -> usize {
+    for b in &rendered.blocks {
+        if row >= b.display_start && row < b.display_end {
+            let span = b.source_range.end.saturating_sub(b.source_range.start);
+            let h = b.display_end.saturating_sub(b.display_start).max(1);
+            let off_in_block = row - b.display_start;
+            return b.source_range.start + (off_in_block * span) / h;
+        }
+    }
+    0
 }
 
 /// Byte offset of the next word boundary after `pos`. Skips through any
@@ -2016,9 +2250,11 @@ index abc..def 100644\n\
         app.viewport = Rect::new(0, 0, 40, 24);
         app.ensure_rendered(40);
         app.enter_edit();
-        // Move the cursor near the end of the buffer so it should be on
-        // a wrapped row well below the first.
+        // This test exercises the legacy in-place toggle (cursor_xy is only
+        // populated in that mode); split mode renders preview without a
+        // cursor in the markdown grid.
         if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().mode = EditMode::InPlace;
             r.edit.as_mut().unwrap().cursor = body.len() - 5;
         }
         app.ensure_rendered(40);
@@ -2043,6 +2279,10 @@ index abc..def 100644\n\
         let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
         app.ensure_rendered(80);
         app.enter_edit();
+        // Block-level toggle is the legacy in-place mode.
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().mode = EditMode::InPlace;
+        }
         // Cursor at byte 0 → in the heading block.
         app.ensure_rendered(80);
 

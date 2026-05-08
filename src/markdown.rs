@@ -707,6 +707,11 @@ impl Builder {
     }
 }
 
+/// Public re-export of `wrap_to_width` for the raw-pane renderer.
+pub fn wrap_to_width_pub(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)> {
+    wrap_to_width(s, max_w)
+}
+
 /// Break `s` into chunks each ≤ `max_w` display columns. Splits on whitespace
 /// when possible; for a single word longer than `max_w`, splits mid-word at
 /// char boundaries. Each chunk records its byte range within `s` so the
