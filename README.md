@@ -2,6 +2,10 @@
 
 A terminal markdown reader. Built with Rust + [ratatui](https://ratatui.rs).
 
+![Reader view](assets/reader.png)
+
+![Split-screen edit mode](assets/edit-split.png)
+
 ## Install
 
 ```sh
