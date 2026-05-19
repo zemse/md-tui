@@ -395,30 +395,23 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         raw_scroll = max_raw_scroll;
     }
 
-    let raw_text_style = Style::default();
     let mut raw_lines: Vec<Line> = Vec::with_capacity(visible_h_raw);
     for i in 0..visible_h_raw {
         let idx = raw_scroll + i;
         if idx >= raw_rows.len() {
             break;
         }
-        let text = raw_rows[idx].text.clone();
-        // Soft heading hint: dim leading "#" for header lines.
-        let style = if text.trim_start().starts_with('#') {
-            Style::default()
+        let row = &raw_rows[idx];
+        // Kind is computed per source line so wrapped continuation rows
+        // keep the same styling as their head row.
+        let style = match row.kind {
+            app::RawRowKind::Heading => Style::default()
                 .fg(theme.heading[0])
-                .add_modifier(Modifier::BOLD)
-        } else if text.trim_start().starts_with('>') {
-            Style::default().fg(theme.quote)
-        } else if text.trim_start().starts_with("- ")
-            || text.trim_start().starts_with("* ")
-            || text.trim_start().starts_with(|c: char| c.is_ascii_digit())
-        {
-            raw_text_style
-        } else {
-            raw_text_style
+                .add_modifier(Modifier::BOLD),
+            app::RawRowKind::Quote => Style::default().fg(theme.quote),
+            app::RawRowKind::Normal => Style::default(),
         };
-        raw_lines.push(Line::from(Span::styled(text, style)));
+        raw_lines.push(Line::from(Span::styled(row.text.clone(), style)));
     }
     f.render_widget(Paragraph::new(raw_lines), raw_area);
 

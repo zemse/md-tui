@@ -1589,6 +1589,16 @@ fn source_line_end(s: &str, line: usize) -> usize {
 // Split-screen edit mode: raw-pane rendering and pane-to-pane scroll sync.
 // ---------------------------------------------------------------------------
 
+/// Visual kind of a raw-pane source line. Computed once per source line
+/// and copied onto every wrapped row, so continuation rows keep the same
+/// styling as the first row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawRowKind {
+    Normal,
+    Heading,
+    Quote,
+}
+
 /// One wrapped row of the raw pane. Pure plain text plus the source byte
 /// range it covers, so click→cursor and cursor→display-row mappings are
 /// trivial in either direction.
@@ -1596,6 +1606,7 @@ fn source_line_end(s: &str, line: usize) -> usize {
 pub struct RawRow {
     pub text: String,
     pub source_range: std::ops::Range<usize>,
+    pub kind: RawRowKind,
 }
 
 /// Wrap `raw` to `width` columns, producing one `RawRow` per display row.
@@ -1617,6 +1628,14 @@ pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
         let line_start = byte;
         let line_len = line.len();
         let stripped = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = stripped.trim_start();
+        let kind = if trimmed.starts_with('#') {
+            RawRowKind::Heading
+        } else if trimmed.starts_with('>') {
+            RawRowKind::Quote
+        } else {
+            RawRowKind::Normal
+        };
         let chunks = markdown::wrap_to_width_pub(stripped, inner_width);
         let chunks: Vec<(std::ops::Range<usize>, String)> = if chunks.is_empty() {
             vec![(0..0, String::new())]
@@ -1629,6 +1648,7 @@ pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
             rows.push(RawRow {
                 text: chunk_text,
                 source_range: src_start..src_end,
+                kind,
             });
         }
         // Advance past `\n` between lines (but not after the last entry,
