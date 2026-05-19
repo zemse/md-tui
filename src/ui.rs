@@ -381,14 +381,24 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         0
     };
 
-    // Auto-scroll raw pane so cursor is visible.
+    // Auto-scroll raw pane so cursor is visible — but only when the cursor
+    // *moved* since the last frame (typing, arrow keys, click). Wheel
+    // scrolling doesn't touch the cursor, so without this gate every frame
+    // would snap the scroll back and the wheel would feel inert.
     let visible_h_raw = raw_area.height as usize;
     let mut raw_scroll = r.scroll as usize;
-    if cur_row_idx < raw_scroll {
-        raw_scroll = cur_row_idx;
-    }
-    if visible_h_raw > 0 && cur_row_idx >= raw_scroll + visible_h_raw {
-        raw_scroll = cur_row_idx + 1 - visible_h_raw;
+    let cursor_changed = r
+        .edit
+        .as_ref()
+        .map(|e| e.last_drawn_cursor != Some(cursor))
+        .unwrap_or(false);
+    if cursor_changed {
+        if cur_row_idx < raw_scroll {
+            raw_scroll = cur_row_idx;
+        }
+        if visible_h_raw > 0 && cur_row_idx >= raw_scroll + visible_h_raw {
+            raw_scroll = cur_row_idx + 1 - visible_h_raw;
+        }
     }
     let max_raw_scroll = raw_rows.len().saturating_sub(visible_h_raw);
     if raw_scroll > max_raw_scroll {
@@ -471,10 +481,14 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Persist scroll positions back to the reader so wheel handlers can
-    // build on them.
+    // build on them. Record the cursor we just drew so the next frame
+    // only re-follows when it actually moved.
     if let View::Reader(r) = &mut app.view {
         r.scroll = raw_scroll as u16;
         r.preview_scroll = prev_scroll as u16;
+        if let Some(e) = r.edit.as_mut() {
+            e.last_drawn_cursor = Some(cursor);
+        }
     }
 }
 

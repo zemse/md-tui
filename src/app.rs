@@ -170,6 +170,13 @@ pub struct EditState {
     pub redo: Vec<EditSnapshot>,
     /// Which UI flavor to render. New edits start `Split`.
     pub mode: EditMode,
+    /// Cursor byte offset the last time we drew. The draw layer compares
+    /// this with the current cursor to decide whether to scroll the raw
+    /// pane to keep the cursor on-screen. `None` means "never drawn yet —
+    /// follow on first frame so the cursor is initially visible". Wheel
+    /// scrolling does not touch the cursor, so the follow logic stays put
+    /// and the scroll sticks.
+    pub last_drawn_cursor: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -772,6 +779,7 @@ impl App {
                 undo: Vec::new(),
                 redo: Vec::new(),
                 mode: EditMode::Split,
+                last_drawn_cursor: None,
             });
             r.rendered = None;
             r.scroll = 0;
