@@ -5,6 +5,8 @@ Built with Rust + [ratatui](https://ratatui.rs).
 
 ![Reader view](assets/reader.png)
 
+Also features a HackMD-style markdown editor — raw on the left, live preview on the right, with synced scroll.
+
 ![HackMD-style split editor](assets/edit-split.png)
 
 ## Install
