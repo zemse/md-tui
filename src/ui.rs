@@ -64,7 +64,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Reserve 1 column on the right for the reader scrollbar so layout stays
     // stable whether or not content overflows. Browser ignores this width.
-    app.ensure_rendered(body.width.saturating_sub(1));
+    // In split-edit mode the preview pane is narrower than the body, so
+    // re-target the wrap width to whichever pane will actually display the
+    // rendered lines — otherwise the preview overflows on the right.
+    let render_width = match &app.view {
+        View::Reader(r) if matches!(r.edit.as_ref().map(|e| e.mode), Some(EditMode::Split)) => {
+            if body.width >= 100 {
+                // Horizontal split: preview is the right half minus separator.
+                body.width.saturating_sub(body.width / 2 + 1)
+            } else {
+                // Vertical stack: preview spans full body width.
+                body.width
+            }
+        }
+        _ => body.width.saturating_sub(1),
+    };
+    app.ensure_rendered(render_width);
 
     if app.git_lens.is_some() && matches!(app.view, View::Reader(_)) {
         draw_git_lens(f, app, body);
