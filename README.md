@@ -1,10 +1,11 @@
 # md
 
-A terminal markdown reader. Built with Rust + [ratatui](https://ratatui.rs).
+A terminal markdown reader with a built-in HackMD-style split editor.
+Built with Rust + [ratatui](https://ratatui.rs).
 
 ![Reader view](assets/reader.png)
 
-![Split-screen edit mode](assets/edit-split.png)
+![HackMD-style split editor](assets/edit-split.png)
 
 ## Install
 
@@ -38,7 +39,7 @@ cat NOTES.md | md # read from stdin
 - **Directory browser** — full-screen one-level listing; `Enter`/`→` opens or descends, `Esc`/`←` walks back; gitignore-aware.
 - **Wiki links** — `[[Page]]` / `[[Page|Display]]` resolve relative to the current file or anywhere under the launch root.
 - **Image rendering** — kitty / iTerm2 / sixel / unicode halfblocks via `ratatui-image` when supported.
-- **`$EDITOR` integration** — press `e` to edit the current file; the TUI restores after the editor exits.
+- **HackMD-style split editor** — press `e` to edit; raw markdown on one side, live preview on the other, with synced scroll. `Ctrl-S` saves, `Esc` exits (twice if dirty).
 - **Header bar** — current path with a clickable back button.
 - **Proportional scrollbar** — thumb size reflects how much of the document is visible.
 - **History** — `h`/`l` (or `b`/`f`) walk back and forward; cursor and scroll position are remembered.
