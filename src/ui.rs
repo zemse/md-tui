@@ -438,18 +438,20 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // ---- Preview pane ----
-    // Sync preview to follow cursor block (cursor-anchored half of the
-    // bidirectional sync; wheel-driven sync lives in the events layer).
+    // Sync preview to follow cursor block — but, like the raw pane, only
+    // when the cursor moved. Otherwise wheel-driven scrolls (which sync
+    // preview via the events layer) would be immediately undone by this
+    // snap-back on the next frame.
     let preview_target = app::preview_row_for_source(rendered, cursor);
     let visible_h_prev = preview_area.height as usize;
     let mut prev_scroll = r.preview_scroll as usize;
-    // Pull the preview to keep the cursor's block visible. We don't snap
-    // to the very top — only adjust when the target is off-screen.
-    if preview_target < prev_scroll {
-        prev_scroll = preview_target;
-    }
-    if visible_h_prev > 0 && preview_target >= prev_scroll + visible_h_prev {
-        prev_scroll = preview_target + 1 - visible_h_prev;
+    if cursor_changed {
+        if preview_target < prev_scroll {
+            prev_scroll = preview_target;
+        }
+        if visible_h_prev > 0 && preview_target >= prev_scroll + visible_h_prev {
+            prev_scroll = preview_target + 1 - visible_h_prev;
+        }
     }
     let max_prev_scroll = rendered.lines.len().saturating_sub(visible_h_prev);
     if prev_scroll > max_prev_scroll {
