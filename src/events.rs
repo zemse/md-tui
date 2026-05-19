@@ -27,7 +27,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // cheaper than a notification thread, and zero new dependencies.
         app.poll_external_change();
         term.draw(|f| ui::draw(f, app))?;
-        if !event::poll(Duration::from_millis(250))? { continue; }
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k)?,
             Event::Mouse(m) => handle_mouse(app, m)?,
@@ -70,9 +72,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // so the user can e.g. press `?` for help while the lens is open.
     if app.git_lens.is_some() {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => { app.git_lens = None; return Ok(()); }
-            KeyCode::Char('j') | KeyCode::Down => { app.git_lens_scroll(1); return Ok(()); }
-            KeyCode::Char('k') | KeyCode::Up => { app.git_lens_scroll(-1); return Ok(()); }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.git_lens = None;
+                return Ok(());
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.git_lens_scroll(1);
+                return Ok(());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.git_lens_scroll(-1);
+                return Ok(());
+            }
             KeyCode::PageDown | KeyCode::Char(' ') => {
                 let h = app.viewport.height as i32;
                 app.git_lens_scroll(h.max(1));
@@ -267,7 +278,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // Browser navigation arrows.
         KeyCode::Right => enter_or_open(app)?,
         KeyCode::Left => {
-            if matches!(app.view, View::Browser(_)) { app.go_back()?; }
+            if matches!(app.view, View::Browser(_)) {
+                app.go_back()?;
+            }
         }
         // `h`/`l` only walk history when not in a count chord. (No conflict
         // with `gh` etc. since we resolved `pending_g` above already.)
@@ -280,7 +293,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 #[derive(Clone, Copy)]
-enum ViewportTarget { Top, Middle, Bottom }
+enum ViewportTarget {
+    Top,
+    Middle,
+    Bottom,
+}
 
 /// Vim H/M/L: place the focused element (or the visible top/middle/bottom
 /// content line) without changing the underlying buffer position. Here, since
@@ -289,7 +306,9 @@ enum ViewportTarget { Top, Middle, Bottom }
 fn scroll_viewport_relative(app: &mut App, target: ViewportTarget) {
     let h = app.viewport.height as usize;
     if let View::Reader(r) = &mut app.view {
-        let Some(rendered) = r.rendered.as_ref() else { return; };
+        let Some(rendered) = r.rendered.as_ref() else {
+            return;
+        };
         let scroll = r.scroll as usize;
         let last = rendered.lines.len().saturating_sub(1);
         let want_line = match target {
@@ -299,7 +318,9 @@ fn scroll_viewport_relative(app: &mut App, target: ViewportTarget) {
         };
         // Pick the focusable nearest to that line, if any.
         let mut targets = r.focus_targets();
-        if targets.is_empty() { return; }
+        if targets.is_empty() {
+            return;
+        }
         targets.sort_by_key(|&(_, line, _)| (line as i64 - want_line as i64).abs());
         r.focus = Some(targets[0].0);
     }
@@ -337,10 +358,22 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Delete on macOS, Ctrl-arrow / Ctrl-Backspace on Linux/Windows).
     if alt || ctrl {
         match key.code {
-            KeyCode::Left => { app.edit_move_word(-1); return Ok(()); }
-            KeyCode::Right => { app.edit_move_word(1); return Ok(()); }
-            KeyCode::Backspace => { app.edit_delete_word(false); return Ok(()); }
-            KeyCode::Delete => { app.edit_delete_word(true); return Ok(()); }
+            KeyCode::Left => {
+                app.edit_move_word(-1);
+                return Ok(());
+            }
+            KeyCode::Right => {
+                app.edit_move_word(1);
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                app.edit_delete_word(false);
+                return Ok(());
+            }
+            KeyCode::Delete => {
+                app.edit_delete_word(true);
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -402,7 +435,9 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             // Anything else clears the discard arm so a stray modifier press
             // doesn't leave the prompt up.
             if let View::Reader(r) = &mut app.view {
-                if let Some(e) = r.edit.as_mut() { e.discard_pending = false; }
+                if let Some(e) = r.edit.as_mut() {
+                    e.discard_pending = false;
+                }
             }
         }
     }
@@ -437,19 +472,25 @@ fn handle_doc_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter => app.doc_search_commit(),
         KeyCode::Backspace => {
             if let View::Reader(r) = &mut app.view {
-                if let Some(s) = &mut r.doc_search { s.query.pop(); }
+                if let Some(s) = &mut r.doc_search {
+                    s.query.pop();
+                }
             }
             app.doc_search_refresh();
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let View::Reader(r) = &mut app.view {
-                if let Some(s) = &mut r.doc_search { s.query.clear(); }
+                if let Some(s) = &mut r.doc_search {
+                    s.query.clear();
+                }
             }
             app.doc_search_refresh();
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let View::Reader(r) = &mut app.view {
-                if let Some(s) = &mut r.doc_search { s.query.push(c); }
+                if let Some(s) = &mut r.doc_search {
+                    s.query.push(c);
+                }
             }
             app.doc_search_refresh();
         }
@@ -476,16 +517,24 @@ fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Down | KeyCode::Tab => {
-            if let Some(s) = &mut app.search { s.move_selection(1); }
+            if let Some(s) = &mut app.search {
+                s.move_selection(1);
+            }
         }
         KeyCode::Up | KeyCode::BackTab => {
-            if let Some(s) = &mut app.search { s.move_selection(-1); }
+            if let Some(s) = &mut app.search {
+                s.move_selection(-1);
+            }
         }
         KeyCode::PageDown => {
-            if let Some(s) = &mut app.search { s.move_selection(10); }
+            if let Some(s) = &mut app.search {
+                s.move_selection(10);
+            }
         }
         KeyCode::PageUp => {
-            if let Some(s) = &mut app.search { s.move_selection(-10); }
+            if let Some(s) = &mut app.search {
+                s.move_selection(-10);
+            }
         }
         KeyCode::Backspace => {
             if let Some(s) = &mut app.search {
@@ -555,10 +604,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     if app.search.is_some() {
         match m.kind {
             MouseEventKind::ScrollUp => {
-                if let Some(s) = &mut app.search { s.move_selection(-1); }
+                if let Some(s) = &mut app.search {
+                    s.move_selection(-1);
+                }
             }
             MouseEventKind::ScrollDown => {
-                if let Some(s) = &mut app.search { s.move_selection(1); }
+                if let Some(s) = &mut app.search {
+                    s.move_selection(1);
+                }
             }
             _ => {}
         }
@@ -623,8 +676,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 if let Some(s) = app.selection.as_mut() {
                     s.focus_line = line_idx;
                     s.focus_col = col;
-                    if !s.dragged
-                        && (s.anchor_line != s.focus_line || s.anchor_col != s.focus_col)
+                    if !s.dragged && (s.anchor_line != s.focus_line || s.anchor_col != s.focus_col)
                     {
                         s.dragged = true;
                         // Drag claimed the gesture; cancel the pending click
@@ -644,10 +696,18 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                             copy_to_clipboard(&text);
                             app.status = format!("Copied {} chars", text.chars().count());
                             true
-                        } else { false }
-                    } else { false }
-                } else { false }
-            } else { false };
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             if copied {
                 app.pending_click = None;
                 return Ok(());
@@ -680,7 +740,11 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     let in_prev = point_in(prev_area, m.column, m.row);
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let dir = if matches!(m.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+            let dir = if matches!(m.kind, MouseEventKind::ScrollUp) {
+                -1
+            } else {
+                1
+            };
             let now = std::time::Instant::now();
             let dampened = compute_dampened_scroll(
                 &mut app.last_scroll_at,
@@ -688,7 +752,9 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 dir * 3,
                 now,
             );
-            if dampened == 0 { return Ok(()); }
+            if dampened == 0 {
+                return Ok(());
+            }
             if in_prev {
                 split_scroll_preview(app, dampened);
             } else {
@@ -714,7 +780,9 @@ fn split_scroll_raw(app: &mut App, delta: i32) {
     let raw_w = app.edit_raw_area.width.max(1) as usize;
     let raw_h = app.edit_raw_area.height as usize;
     let prev_h = app.edit_preview_area.height as usize;
-    let View::Reader(r) = &mut app.view else { return };
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
     let rows = crate::app::render_raw_pane(&r.raw, raw_w);
     let max = rows.len().saturating_sub(raw_h.max(1)) as i32;
     let new = (r.scroll as i32 + delta).clamp(0, max) as u16;
@@ -735,8 +803,12 @@ fn split_scroll_preview(app: &mut App, delta: i32) {
     let raw_w = app.edit_raw_area.width.max(1) as usize;
     let raw_h = app.edit_raw_area.height as usize;
     let prev_h = app.edit_preview_area.height as usize;
-    let View::Reader(r) = &mut app.view else { return };
-    let Some(rendered) = r.rendered.as_ref() else { return };
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
+    let Some(rendered) = r.rendered.as_ref() else {
+        return;
+    };
     let max_prev = rendered.lines.len().saturating_sub(prev_h.max(1)) as i32;
     let new = (r.preview_scroll as i32 + delta).clamp(0, max_prev) as u16;
     r.preview_scroll = new;
@@ -752,13 +824,18 @@ fn split_scroll_preview(app: &mut App, delta: i32) {
 fn split_click_raw(app: &mut App, col: u16, row: u16) {
     let raw_w = app.edit_raw_area.width.max(1) as usize;
     let area = app.edit_raw_area;
-    if !point_in(area, col, row) { return; }
-    let local_row = (row - area.y) as usize + match &app.view {
-        View::Reader(r) => r.scroll as usize,
-        _ => 0,
-    };
+    if !point_in(area, col, row) {
+        return;
+    }
+    let local_row = (row - area.y) as usize
+        + match &app.view {
+            View::Reader(r) => r.scroll as usize,
+            _ => 0,
+        };
     let local_col = (col - area.x) as usize;
-    let View::Reader(r) = &mut app.view else { return };
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
     let rows = crate::app::render_raw_pane(&r.raw, raw_w);
     let new_cursor = crate::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
     if let Some(e) = r.edit.as_mut() {
@@ -772,9 +849,15 @@ fn split_click_raw(app: &mut App, col: u16, row: u16) {
 /// Useful for navigating to a section by clicking the rendered headline.
 fn split_click_preview(app: &mut App, col: u16, row: u16) {
     let area = app.edit_preview_area;
-    if !point_in(area, col, row) { return; }
-    let View::Reader(r) = &mut app.view else { return };
-    let Some(rendered) = r.rendered.as_ref() else { return };
+    if !point_in(area, col, row) {
+        return;
+    }
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
+    let Some(rendered) = r.rendered.as_ref() else {
+        return;
+    };
     let local_row = (row - area.y) as usize + r.preview_scroll as usize;
     let _ = col;
     let new_cursor = crate::app::source_for_preview_row(rendered, local_row);
@@ -791,8 +874,12 @@ fn split_click_preview(app: &mut App, col: u16, row: u16) {
 /// scrolling mid-drag.
 fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
     let body = app.viewport;
-    if row < body.y || row >= body.y + body.height { return None; }
-    if col < body.x { return None; }
+    if row < body.y || row >= body.y + body.height {
+        return None;
+    }
+    if col < body.x {
+        return None;
+    }
     let line_num_w = if app.opts.line_numbers {
         match &app.view {
             View::Reader(r) => match &r.rendered {
@@ -801,8 +888,12 @@ fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
             },
             _ => 0,
         }
-    } else { 0 };
-    if col < body.x + line_num_w { return None; }
+    } else {
+        0
+    };
+    if col < body.x + line_num_w {
+        return None;
+    }
     let scroll = match &app.view {
         View::Reader(r) => r.scroll as usize,
         View::Browser(b) => b.scroll as usize,
@@ -817,7 +908,9 @@ fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
 /// `None` if the reader hasn't been rendered yet.
 fn extract_selection_text(app: &App, sel: &crate::app::Selection) -> Option<String> {
     use unicode_width::UnicodeWidthChar;
-    let View::Reader(r) = &app.view else { return None };
+    let View::Reader(r) = &app.view else {
+        return None;
+    };
     let rd = r.rendered.as_ref()?;
     let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
     let last = rd.lines.len().saturating_sub(1);
@@ -825,7 +918,11 @@ fn extract_selection_text(app: &App, sel: &crate::app::Selection) -> Option<Stri
     for li in s_line..=e_line.min(last) {
         let line = &rd.lines[li];
         let from = if li == s_line { s_col as usize } else { 0 };
-        let to = if li == e_line { e_col as usize } else { usize::MAX };
+        let to = if li == e_line {
+            e_col as usize
+        } else {
+            usize::MAX
+        };
         let mut col = 0usize;
         let mut wrote_any = false;
         for span in &line.spans {
@@ -837,9 +934,13 @@ fn extract_selection_text(app: &App, sel: &crate::app::Selection) -> Option<Stri
                     wrote_any = true;
                 }
                 col = next;
-                if col >= to { break; }
+                if col >= to {
+                    break;
+                }
             }
-            if col >= to { break; }
+            if col >= to {
+                break;
+            }
         }
         let _ = wrote_any;
         if li < e_line.min(last) {
@@ -854,21 +955,35 @@ fn extract_selection_text(app: &App, sel: &crate::app::Selection) -> Option<Stri
 /// as a fallback so it still works over SSH. Updates the status bar.
 fn select_word_at(app: &mut App, col: u16, row: u16) {
     let area = app.viewport;
-    if !point_in(area, col, row) { return; }
-    let View::Reader(r) = &app.view else { return; };
-    let Some(rendered) = &r.rendered else { return; };
+    if !point_in(area, col, row) {
+        return;
+    }
+    let View::Reader(r) = &app.view else {
+        return;
+    };
+    let Some(rendered) = &r.rendered else {
+        return;
+    };
 
     let line_num_w = if app.opts.line_numbers {
         (format!("{}", rendered.lines.len()).len() + 1) as u16
-    } else { 0 };
+    } else {
+        0
+    };
     let inner_x = area.x + line_num_w;
-    if col < inner_x { return; }
+    if col < inner_x {
+        return;
+    }
     let local_col = (col - inner_x) as usize;
     let line_idx = r.scroll as usize + (row - area.y) as usize;
-    let Some(line) = rendered.lines.get(line_idx) else { return; };
+    let Some(line) = rendered.lines.get(line_idx) else {
+        return;
+    };
 
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let Some(word) = word_at_col(&text, local_col) else { return; };
+    let Some(word) = word_at_col(&text, local_col) else {
+        return;
+    };
 
     copy_to_clipboard(&word);
     app.status = format!("Copied: {}", word);
@@ -894,8 +1009,8 @@ fn copy_to_clipboard(text: &str) {
 }
 
 fn osc52_copy(text: &str) {
-    use std::io::Write;
     use base64::Engine;
+    use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut out = stdout();
     if std::env::var_os("TMUX").is_some() {
@@ -952,7 +1067,10 @@ mod scroll_damp_tests {
             total += compute_dampened_scroll(&mut last, &mut accum, 3, t);
         }
         // Raw would have been 6 * 3 = 18 lines; dampened ≈ 9.
-        assert_eq!(total, 9, "burst of 6 events at 3 lines should yield ~9 dampened");
+        assert_eq!(
+            total, 9,
+            "burst of 6 events at 3 lines should yield ~9 dampened"
+        );
     }
 
     #[test]
@@ -978,7 +1096,11 @@ mod scroll_damp_tests {
         let _ = compute_dampened_scroll(&mut last, &mut accum, 3, now);
         // Accum should have been zeroed before this event's contribution.
         // After a 2-second gap, factor=1.0, so 3 lines emitted, accum back to 0.
-        assert!(accum.abs() < 1e-4, "accum should reset on long pause, got {}", accum);
+        assert!(
+            accum.abs() < 1e-4,
+            "accum should reset on long pause, got {}",
+            accum
+        );
     }
 
     #[test]
@@ -995,7 +1117,11 @@ mod scroll_damp_tests {
         // first up-scroll line.
         let t2 = t1 + Duration::from_millis(50);
         let d = compute_dampened_scroll(&mut last, &mut accum, -3, t2);
-        assert!(d <= -1, "reversal should still emit a line in the new direction, got {}", d);
+        assert!(
+            d <= -1,
+            "reversal should still emit a line in the new direction, got {}",
+            d
+        );
     }
 }
 
@@ -1058,9 +1184,10 @@ fn xy_to_source_offset(
     // Formatted row: bytes don't map 1:1 with display columns, so jump
     // to the start of the block. The next render makes this block raw,
     // and a follow-up click can land precisely.
-    let block = rendered.blocks.iter().find(|b| {
-        line_idx >= b.display_start && line_idx < b.display_end
-    })?;
+    let block = rendered
+        .blocks
+        .iter()
+        .find(|b| line_idx >= b.display_start && line_idx < b.display_end)?;
     Some(block.source_range.start)
 }
 
@@ -1080,13 +1207,19 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
     }
     let hit = hit_byte?;
     let bytes = line.as_bytes();
-    if bytes.get(hit).map(|b| (*b as char).is_whitespace()).unwrap_or(true) {
+    if bytes
+        .get(hit)
+        .map(|b| (*b as char).is_whitespace())
+        .unwrap_or(true)
+    {
         return None;
     }
     let mut start = hit;
     while start > 0 {
         let prev = line[..start].chars().next_back()?;
-        if prev.is_whitespace() { break; }
+        if prev.is_whitespace() {
+            break;
+        }
         start -= prev.len_utf8();
     }
     let mut end = hit;
@@ -1095,18 +1228,26 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
     let len = line.len();
     let mut cursor = hit;
     for (_, ch) in line[hit..].char_indices() {
-        if ch.is_whitespace() { break; }
+        if ch.is_whitespace() {
+            break;
+        }
         cursor += ch.len_utf8();
         end = cursor;
     }
     let _ = iter;
     let _ = len;
-    if end <= start { return None; }
+    if end <= start {
+        return None;
+    }
     let word = line[start..end].trim_matches(|c: char| {
         // Strip leading/trailing punctuation but keep internal characters.
         c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '.' | '#')
     });
-    if word.is_empty() { None } else { Some(word.to_string()) }
+    if word.is_empty() {
+        None
+    } else {
+        Some(word.to_string())
+    }
 }
 
 fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
@@ -1149,7 +1290,9 @@ fn compute_dampened_scroll(
     requested: i32,
     now: std::time::Instant,
 ) -> i32 {
-    if requested == 0 { return 0; }
+    if requested == 0 {
+        return 0;
+    }
 
     let elapsed_ms = last_at
         .map(|t| now.duration_since(t).as_millis() as u32)
@@ -1195,7 +1338,9 @@ fn scroll_by(app: &mut App, delta: i32) {
         }
         View::Browser(b) => {
             let n = b.entries.len() as i32;
-            if n == 0 { return; }
+            if n == 0 {
+                return;
+            }
             // Wrap-around: pressing `k` at the top jumps to the last entry,
             // pressing `j` at the bottom jumps back to the first. rem_euclid
             // handles negative dividends correctly so a `-1` delta from
@@ -1255,8 +1400,12 @@ fn walk_focus(app: &mut App, delta: i32) {
     if let View::Reader(r) = &mut app.view {
         let targets = r.focus_targets();
         let n = targets.len();
-        if n == 0 { return; }
-        let cur_idx = r.focus.and_then(|f| targets.iter().position(|(t, _, _)| *t == f));
+        if n == 0 {
+            return;
+        }
+        let cur_idx = r
+            .focus
+            .and_then(|f| targets.iter().position(|(t, _, _)| *t == f));
         let new_idx: usize = match cur_idx {
             Some(i) => ((i as i32 + delta).rem_euclid(n as i32)) as usize,
             None if delta >= 0 => 0,
@@ -1343,10 +1492,14 @@ fn open_focused(app: &mut App) -> Result<()> {
 fn update_hover(app: &mut App, col: u16, row: u16) {
     let area = app.viewport;
     if let View::Reader(r) = &mut app.view {
-        let Some(rendered) = &r.rendered else { return; };
+        let Some(rendered) = &r.rendered else {
+            return;
+        };
         let line_num_w = if app.opts.line_numbers {
             (format!("{}", rendered.lines.len()).len() + 1) as u16
-        } else { 0 };
+        } else {
+            0
+        };
         let inner_x = area.x + line_num_w;
         if col < inner_x {
             r.hover_link = None;
@@ -1365,12 +1518,18 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
     let area = app.viewport;
     let entry_to_open = match &mut app.view {
         View::Reader(r) => {
-            let Some(rendered) = &r.rendered else { return Ok(()); };
+            let Some(rendered) = &r.rendered else {
+                return Ok(());
+            };
             let line_num_w = if app.opts.line_numbers {
                 (format!("{}", rendered.lines.len()).len() + 1) as u16
-            } else { 0 };
+            } else {
+                0
+            };
             let inner_x = area.x + line_num_w;
-            if col < inner_x { return Ok(()); }
+            if col < inner_x {
+                return Ok(());
+            }
             let local_col = (col - inner_x) as usize;
             let local_row = (row - area.y) as usize;
             let line_idx = r.scroll as usize + local_row;

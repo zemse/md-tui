@@ -123,7 +123,11 @@ struct BlockEntry {
 #[derive(Clone, Debug)]
 enum Block {
     /// Flowing paragraph — word-wrapped.
-    Paragraph { runs: Vec<Run>, prefix: Vec<Run>, hanging: Vec<Run> },
+    Paragraph {
+        runs: Vec<Run>,
+        prefix: Vec<Run>,
+        hanging: Vec<Run>,
+    },
     /// Heading — word-wrapped, anchor recorded.
     Heading { runs: Vec<Run>, anchor: String },
     /// Pre-formatted block — rendered line-by-line, not wrapped. `flat` is
@@ -218,7 +222,13 @@ struct ListFrame {
 }
 
 impl Builder {
-    fn new(theme: Theme, width: usize, base_dir: Option<PathBuf>, source: String, edit: Option<EditCtx>) -> Self {
+    fn new(
+        theme: Theme,
+        width: usize,
+        base_dir: Option<PathBuf>,
+        source: String,
+        edit: Option<EditCtx>,
+    ) -> Self {
         let width = if width == 0 { 80 } else { width };
         Self {
             theme,
@@ -267,19 +277,25 @@ impl Builder {
     }
 
     fn quote_prefix(&self) -> Vec<Run> {
-        if self.quote_depth == 0 { return Vec::new(); }
+        if self.quote_depth == 0 {
+            return Vec::new();
+        }
         let bar = "│ ".repeat(self.quote_depth);
         vec![Run {
             text: bar,
             style: Style::default().fg(self.theme.quote),
             link: None,
             checkbox: None,
-            image: None, inline_range: None, cursor_at: None
+            image: None,
+            inline_range: None,
+            cursor_at: None,
         }]
     }
 
     fn list_prefixes(&mut self) -> (Vec<Run>, Vec<Run>) {
-        if self.list_stack.is_empty() { return (Vec::new(), Vec::new()); }
+        if self.list_stack.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
         let depth = self.list_stack.len();
         let indent = "  ".repeat(depth - 1);
         let frame = self.list_stack.last_mut().unwrap();
@@ -294,27 +310,51 @@ impl Builder {
         let pad = " ".repeat(marker.chars().count());
         let style = Style::default().fg(self.theme.list_marker);
         let prefix = vec![
-            Run { text: indent.clone(), style: Style::default(), link: None, checkbox: None, image: None , inline_range: None, cursor_at: None},
-            Run { text: marker, style, link: None, checkbox: None, image: None , inline_range: None, cursor_at: None},
+            Run {
+                text: indent.clone(),
+                style: Style::default(),
+                link: None,
+                checkbox: None,
+                image: None,
+                inline_range: None,
+                cursor_at: None,
+            },
+            Run {
+                text: marker,
+                style,
+                link: None,
+                checkbox: None,
+                image: None,
+                inline_range: None,
+                cursor_at: None,
+            },
         ];
         let hanging = vec![Run {
             text: format!("{}{}", indent, pad),
             style: Style::default(),
             link: None,
             checkbox: None,
-            image: None, inline_range: None, cursor_at: None
+            image: None,
+            inline_range: None,
+            cursor_at: None,
         }];
         (prefix, hanging)
     }
 
     fn push_block(&mut self, block: Block, source_range: std::ops::Range<usize>) {
-        self.blocks.push(BlockEntry { block, source_range });
+        self.blocks.push(BlockEntry {
+            block,
+            source_range,
+        });
     }
 
     /// Spacer block emitted between content blocks. No source range — the
     /// renderer treats the cursor as never landing on these.
     fn push_blank(&mut self) {
-        self.blocks.push(BlockEntry { block: Block::Blank, source_range: 0..0 });
+        self.blocks.push(BlockEntry {
+            block: Block::Blank,
+            source_range: 0..0,
+        });
     }
 
     fn finish_paragraph(&mut self, source_range: std::ops::Range<usize>) {
@@ -326,7 +366,14 @@ impl Builder {
         let mut hanging = self.quote_prefix();
         hanging.extend(self.cur_hanging.drain(..));
         let runs = std::mem::take(&mut self.cur_runs);
-        self.push_block(Block::Paragraph { runs, prefix, hanging }, source_range);
+        self.push_block(
+            Block::Paragraph {
+                runs,
+                prefix,
+                hanging,
+            },
+            source_range,
+        );
     }
 
     fn push_text(&mut self, text: &str) {
@@ -384,7 +431,9 @@ impl Builder {
                     style,
                     link: self.open_link,
                     checkbox: None,
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             Event::SoftBreak => {
@@ -393,7 +442,9 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             Event::HardBreak => {
@@ -402,7 +453,9 @@ impl Builder {
                     style: self.cur_style(),
                     link: self.open_link,
                     checkbox: None,
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             Event::Rule => self.push_block(Block::Rule, range.clone()),
@@ -421,14 +474,18 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: Some(cb_idx),
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
                 self.cur_runs.push(Run {
                     text: " ".to_string(),
                     style: Style::default(),
                     link: None,
                     checkbox: None,
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             _ => {}
@@ -495,7 +552,9 @@ impl Builder {
                 self.style_stack.push(style);
                 self.inline_range_stack.push(range.clone());
             }
-            Tag::Image { dest_url, title, .. } => {
+            Tag::Image {
+                dest_url, title, ..
+            } => {
                 let style = Style::default().fg(self.theme.muted);
                 let label = if title.is_empty() {
                     format!("[image: {}]", dest_url)
@@ -514,7 +573,9 @@ impl Builder {
                     style,
                     link: None,
                     checkbox: None,
-                    image: Some(img_idx), inline_range: None, cursor_at: None
+                    image: Some(img_idx),
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             Tag::Table(aligns) => {
@@ -533,13 +594,17 @@ impl Builder {
                 }
             }
             Tag::FootnoteDefinition(name) => {
-                let style = Style::default().fg(self.theme.muted).add_modifier(Modifier::BOLD);
+                let style = Style::default()
+                    .fg(self.theme.muted)
+                    .add_modifier(Modifier::BOLD);
                 self.cur_runs.push(Run {
                     text: format!("[^{}]: ", name),
                     style,
                     link: None,
                     checkbox: None,
-                    image: None, inline_range: None, cursor_at: None
+                    image: None,
+                    inline_range: None,
+                    cursor_at: None,
                 });
             }
             _ => {}
@@ -564,7 +629,9 @@ impl Builder {
                 self.cur_hanging.clear();
             }
             TagEnd::BlockQuote(_) => {
-                if self.quote_depth > 0 { self.quote_depth -= 1; }
+                if self.quote_depth > 0 {
+                    self.quote_depth -= 1;
+                }
                 if self.quote_depth == 0 {
                     self.push_blank();
                 }
@@ -589,14 +656,24 @@ impl Builder {
                                 style: sp.style,
                                 link: None,
                                 checkbox: None,
-                                image: None, inline_range: None, cursor_at: None
+                                image: None,
+                                inline_range: None,
+                                cursor_at: None,
                             })
                             .collect()
                     })
                     .collect();
                 let prefix = self.quote_prefix();
                 self.code_content.clear();
-                self.push_block(Block::Pre { lines, prefix, flat: false, line_sources: Vec::new() }, range);
+                self.push_block(
+                    Block::Pre {
+                        lines,
+                        prefix,
+                        flat: false,
+                        line_sources: Vec::new(),
+                    },
+                    range,
+                );
                 self.push_blank();
             }
             TagEnd::List(_) => {
@@ -669,7 +746,9 @@ impl Builder {
         if let Some(ctx) = self.edit {
             let cursor = ctx.cursor;
             for entry in &mut self.blocks {
-                if entry.source_range.is_empty() { continue; }
+                if entry.source_range.is_empty() {
+                    continue;
+                }
                 if !(entry.source_range.start <= cursor && cursor <= entry.source_range.end) {
                     continue;
                 }
@@ -719,7 +798,9 @@ pub fn wrap_to_width_pub(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, 
 fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)> {
     use unicode_width::UnicodeWidthChar;
     let mut out = Vec::new();
-    if s.is_empty() { return out; }
+    if s.is_empty() {
+        return out;
+    }
     if max_w == 0 {
         out.push((0..s.len(), s.to_string()));
         return out;
@@ -736,7 +817,9 @@ fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)>
             // Wrap. Prefer the most recent whitespace boundary; if there
             // wasn't one inside the current line, hard-break at `idx`.
             let break_at = last_break.filter(|&b| b > line_start).unwrap_or(idx);
-            let text = s[line_start..break_at].trim_end_matches(|c: char| c.is_whitespace()).to_string();
+            let text = s[line_start..break_at]
+                .trim_end_matches(|c: char| c.is_whitespace())
+                .to_string();
             out.push((line_start..break_at, text));
             line_start = break_at;
             col = 0;
@@ -778,29 +861,35 @@ fn substitute_inline_at_cursor(
                     None => true,
                     Some(b) => (rng.end - rng.start) < (b.end - b.start),
                 };
-                if take { best = Some(rng.clone()); }
+                if take {
+                    best = Some(rng.clone());
+                }
             }
         }
     }
-    let elem = match best { Some(r) => r, None => return false };
+    let elem = match best {
+        Some(r) => r,
+        None => return false,
+    };
 
     // Find the contiguous slice of runs whose inline_range matches `elem`.
     // (Innermost-only tracking means matching ranges are contiguous within
     // a paragraph.)
-    let first = runs.iter().position(|r| r.inline_range.as_ref() == Some(&elem));
-    let first = match first { Some(i) => i, None => return false };
+    let first = runs
+        .iter()
+        .position(|r| r.inline_range.as_ref() == Some(&elem));
+    let first = match first {
+        Some(i) => i,
+        None => return false,
+    };
     let mut last = first;
-    while last + 1 < runs.len()
-        && runs[last + 1].inline_range.as_ref() == Some(&elem)
-    {
+    while last + 1 < runs.len() && runs[last + 1].inline_range.as_ref() == Some(&elem) {
         last += 1;
     }
 
     let raw = source.get(elem.clone()).unwrap_or("").to_string();
     let cursor_at = cursor.saturating_sub(elem.start).min(raw.len());
-    let style = Style::default()
-        .fg(theme.muted)
-        .bg_opt(theme.code_bg);
+    let style = Style::default().fg(theme.muted).bg_opt(theme.code_bg);
     let synthetic = Run {
         text: raw,
         style,
@@ -819,7 +908,13 @@ fn substitute_inline_at_cursor(
 /// of the block under the cursor with its underlying markdown text. We use
 /// the muted text color (no code background) so it visually distinguishes
 /// from real code blocks.
-fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, width: usize, theme: &Theme) -> Block {
+fn make_raw_block(
+    source: &str,
+    range: &std::ops::Range<usize>,
+    cursor: usize,
+    width: usize,
+    theme: &Theme,
+) -> Block {
     let slice = source.get(range.clone()).unwrap_or("");
     let style = Style::default().fg(theme.muted);
     let cursor_in_block = cursor.saturating_sub(range.start);
@@ -849,15 +944,24 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
             // counts from the start of the source range, so add byte_idx.
             let chunk_block_start = byte_idx + chunk_range.start;
             let chunk_block_end = byte_idx + chunk_range.end;
-            let cursor_at = if cursor_in_block >= chunk_block_start && cursor_in_block <= chunk_block_end {
-                Some(cursor_in_block - chunk_block_start)
-            } else {
-                None
-            };
+            let cursor_at =
+                if cursor_in_block >= chunk_block_start && cursor_in_block <= chunk_block_end {
+                    Some(cursor_in_block - chunk_block_start)
+                } else {
+                    None
+                };
             if chunk_text.is_empty() && cursor_at.is_none() {
                 lines.push(Vec::new());
             } else {
-                lines.push(vec![Run { text: chunk_text, style, link: None, checkbox: None, image: None, inline_range: None, cursor_at }]);
+                lines.push(vec![Run {
+                    text: chunk_text,
+                    style,
+                    link: None,
+                    checkbox: None,
+                    image: None,
+                    inline_range: None,
+                    cursor_at,
+                }]);
             }
             // Source byte range covered by this display row, in `source`
             // coordinates. Edit mode uses this to map clicks/cursor moves
@@ -871,7 +975,12 @@ fn make_raw_block(source: &str, range: &std::ops::Range<usize>, cursor: usize, w
     // Render with no left-pad / quote-bar prefix so the raw text aligns to
     // column 0 — that lets the cursor display position math match the
     // source-line column directly.
-    Block::Pre { lines, prefix: Vec::new(), flat: true, line_sources }
+    Block::Pre {
+        lines,
+        prefix: Vec::new(),
+        flat: true,
+        line_sources,
+    }
 }
 
 fn heading_idx(l: HeadingLevel) -> usize {
@@ -917,7 +1026,11 @@ fn layout(
         let block = entry.block;
         match block {
             Block::Blank => {
-                if out_lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
+                if out_lines
+                    .last()
+                    .map(|l| l.spans.is_empty())
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 out_lines.push(Line::from(""));
@@ -948,7 +1061,11 @@ fn layout(
                     &mut cursor_xy,
                 );
             }
-            Block::Paragraph { runs, prefix, hanging } => {
+            Block::Paragraph {
+                runs,
+                prefix,
+                hanging,
+            } => {
                 wrap_runs(
                     &runs,
                     &prefix,
@@ -964,15 +1081,34 @@ fn layout(
                     &mut cursor_xy,
                 );
             }
-            Block::Table { alignments, header, rows } => {
-                layout_table(theme, &alignments, &header, &rows, width, &mut out_lines, &mut out_links, &links);
+            Block::Table {
+                alignments,
+                header,
+                rows,
+            } => {
+                layout_table(
+                    theme,
+                    &alignments,
+                    &header,
+                    &rows,
+                    width,
+                    &mut out_lines,
+                    &mut out_links,
+                    &links,
+                );
             }
-            Block::Pre { lines, prefix, flat, line_sources } => {
+            Block::Pre {
+                lines,
+                prefix,
+                flat,
+                line_sources,
+            } => {
                 // Flat = edit-mode raw substitution: skip the 2-col left pad
                 // and code background so the rendered output lines up
                 // visually with view-mode formatting of the same source.
                 let pad_left = if flat { "" } else { "  " };
-                let prefix_width = prefix.iter().map(|r| r.text.width()).sum::<usize>() + pad_left.width();
+                let prefix_width =
+                    prefix.iter().map(|r| r.text.width()).sum::<usize>() + pad_left.width();
                 let bg = if flat { None } else { theme.code_bg };
                 for (i, line_runs) in lines.into_iter().enumerate() {
                     let line_y = out_lines.len() as u16;
@@ -1016,14 +1152,18 @@ fn layout(
                     // formatted and stays None.
                     let src = if flat {
                         line_sources.get(i).cloned().unwrap_or(None)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     row_source.push(src);
                 }
             }
         }
         // Pad row_source so it stays parallel to out_lines for blocks that
         // don't fill it themselves.
-        while row_source.len() < out_lines.len() { row_source.push(None); }
+        while row_source.len() < out_lines.len() {
+            row_source.push(None);
+        }
         let block_end_line = out_lines.len();
         if !block_source_range.is_empty() {
             block_infos.push(BlockInfo {
@@ -1044,7 +1184,9 @@ fn layout(
         links: out_links,
         anchors,
     };
-    let checkbox_map = CheckboxMap { items: out_checkboxes };
+    let checkbox_map = CheckboxMap {
+        items: out_checkboxes,
+    };
     let images_out: Vec<ImageRef> = images
         .into_iter()
         .zip(image_lines.iter())
@@ -1111,27 +1253,27 @@ fn wrap_runs(
                           cur_inner: &mut usize,
                           run: &Run,
                           chunk: &str| {
-        if chunk.is_empty() { return; }
+        if chunk.is_empty() {
+            return;
+        }
         let w = chunk.width();
         cur_spans.push(Span::styled(chunk.to_string(), run.style));
         *cur_col += w;
         *cur_inner += w;
     };
 
-    let break_line = |
-        out_lines: &mut Vec<Line<'static>>,
-        cur_spans: &mut Vec<Span<'static>>,
-        cur_col: &mut usize,
-        cur_inner: &mut usize,
-        active_inner_width: &mut usize,
-        at_line_start: &mut bool,
-        out_links: &mut Vec<LinkSpan>,
-        open_spans: &mut [Option<OpenSpan>],
-        current_link: &mut Option<usize>,
-        links: &[PendingLink],
-        hanging: &[Run],
-        cont_inner_width: usize,
-    | {
+    let break_line = |out_lines: &mut Vec<Line<'static>>,
+                      cur_spans: &mut Vec<Span<'static>>,
+                      cur_col: &mut usize,
+                      cur_inner: &mut usize,
+                      active_inner_width: &mut usize,
+                      at_line_start: &mut bool,
+                      out_links: &mut Vec<LinkSpan>,
+                      open_spans: &mut [Option<OpenSpan>],
+                      current_link: &mut Option<usize>,
+                      links: &[PendingLink],
+                      hanging: &[Run],
+                      cont_inner_width: usize| {
         // Close any open link span on this line.
         if let Some(li) = *current_link {
             if let Some(open) = open_spans[li].take() {
@@ -1173,14 +1315,18 @@ fn wrap_runs(
         // If it does wrap, the cursor lands at the run-start position
         // (still inside the substituted text, just possibly at a row above
         // its true location). Acceptable for an MVP.
-        let cursor_run_start = run.cursor_at.map(|c| (out_lines.len() as u16, cur_col as u16, c));
+        let cursor_run_start = run
+            .cursor_at
+            .map(|c| (out_lines.len() as u16, cur_col as u16, c));
 
         // Capture checkbox start position before emit; close after.
         let cb_start = run.checkbox.map(|ci| (ci, out_lines.len(), cur_col));
         // Pin the image's output line at the moment its placeholder is emitted.
         if let Some(ii) = run.image {
             if let Some(slot) = image_lines.get_mut(ii) {
-                if slot.is_none() { *slot = Some(out_lines.len()); }
+                if slot.is_none() {
+                    *slot = Some(out_lines.len());
+                }
             }
         }
 
@@ -1357,14 +1503,31 @@ fn emit_segment(
             if *cur_inner + w > *active_inner_width {
                 // Drop trailing whitespace and break.
                 break_line_inline(
-                    out_lines, cur_spans, cur_col, cur_inner, at_line_start,
-                    active_inner_width, out_links, open_spans, current_link,
-                    links, hanging, cont_inner_width,
+                    out_lines,
+                    cur_spans,
+                    cur_col,
+                    cur_inner,
+                    at_line_start,
+                    active_inner_width,
+                    out_links,
+                    open_spans,
+                    current_link,
+                    links,
+                    hanging,
+                    cont_inner_width,
                 );
                 remaining = rest;
                 continue;
             }
-            push_chunk(cur_spans, cur_col, cur_inner, run, word, current_link, open_spans);
+            push_chunk(
+                cur_spans,
+                cur_col,
+                cur_inner,
+                run,
+                word,
+                current_link,
+                open_spans,
+            );
             *at_line_start = false;
             remaining = rest;
             continue;
@@ -1378,9 +1541,18 @@ fn emit_segment(
                 let avail = active_inner_width.saturating_sub(*cur_inner);
                 if avail == 0 && !*at_line_start {
                     break_line_inline(
-                        out_lines, cur_spans, cur_col, cur_inner, at_line_start,
-                        active_inner_width, out_links, open_spans, current_link,
-                        links, hanging, cont_inner_width,
+                        out_lines,
+                        cur_spans,
+                        cur_col,
+                        cur_inner,
+                        at_line_start,
+                        active_inner_width,
+                        out_links,
+                        open_spans,
+                        current_link,
+                        links,
+                        hanging,
+                        cont_inner_width,
                     );
                     continue;
                 }
@@ -1388,19 +1560,40 @@ fn emit_segment(
                 let mut taken_w = 0usize;
                 for (i, c) in chars_left.char_indices() {
                     let cw = c.to_string().width();
-                    if taken_w + cw > avail.max(1) { break; }
+                    if taken_w + cw > avail.max(1) {
+                        break;
+                    }
                     taken = i + c.len_utf8();
                     taken_w += cw;
                 }
-                if taken == 0 { taken = chars_left.chars().next().unwrap().len_utf8(); }
+                if taken == 0 {
+                    taken = chars_left.chars().next().unwrap().len_utf8();
+                }
                 let (head, tail) = chars_left.split_at(taken);
-                push_chunk(cur_spans, cur_col, cur_inner, run, head, current_link, open_spans);
+                push_chunk(
+                    cur_spans,
+                    cur_col,
+                    cur_inner,
+                    run,
+                    head,
+                    current_link,
+                    open_spans,
+                );
                 *at_line_start = false;
                 if !tail.is_empty() {
                     break_line_inline(
-                        out_lines, cur_spans, cur_col, cur_inner, at_line_start,
-                        active_inner_width, out_links, open_spans, current_link,
-                        links, hanging, cont_inner_width,
+                        out_lines,
+                        cur_spans,
+                        cur_col,
+                        cur_inner,
+                        at_line_start,
+                        active_inner_width,
+                        out_links,
+                        open_spans,
+                        current_link,
+                        links,
+                        hanging,
+                        cont_inner_width,
                     );
                 }
                 chars_left = tail;
@@ -1411,12 +1604,29 @@ fn emit_segment(
 
         if *cur_inner + w > *active_inner_width && !*at_line_start {
             break_line_inline(
-                out_lines, cur_spans, cur_col, cur_inner, at_line_start,
-                active_inner_width, out_links, open_spans, current_link,
-                links, hanging, cont_inner_width,
+                out_lines,
+                cur_spans,
+                cur_col,
+                cur_inner,
+                at_line_start,
+                active_inner_width,
+                out_links,
+                open_spans,
+                current_link,
+                links,
+                hanging,
+                cont_inner_width,
             );
         }
-        push_chunk(cur_spans, cur_col, cur_inner, run, word, current_link, open_spans);
+        push_chunk(
+            cur_spans,
+            cur_col,
+            cur_inner,
+            run,
+            word,
+            current_link,
+            open_spans,
+        );
         *at_line_start = false;
         remaining = rest;
     }
@@ -1431,7 +1641,9 @@ fn push_chunk(
     current_link: &Option<usize>,
     open_spans: &mut [Option<OpenSpan>],
 ) {
-    if chunk.is_empty() { return; }
+    if chunk.is_empty() {
+        return;
+    }
     let w = chunk.width();
     cur_spans.push(Span::styled(chunk.to_string(), run.style));
     *cur_col += w;
@@ -1496,7 +1708,10 @@ trait StyleExt {
 }
 impl StyleExt for Style {
     fn bg_opt(self, c: Option<Color>) -> Style {
-        match c { Some(col) => self.bg(col), None => self }
+        match c {
+            Some(col) => self.bg(col),
+            None => self,
+        }
     }
 }
 
@@ -1514,18 +1729,26 @@ fn layout_table(
     out_links: &mut Vec<LinkSpan>,
     links: &[PendingLink],
 ) {
-    let n_cols = header.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-    if n_cols == 0 { return; }
+    let n_cols = header
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if n_cols == 0 {
+        return;
+    }
 
     let cell_w = |runs: &[Run]| -> usize { runs.iter().map(|r| r.text.width()).sum() };
 
     let mut col_widths = vec![0usize; n_cols];
     for (i, c) in header.iter().enumerate() {
-        if i < n_cols { col_widths[i] = col_widths[i].max(cell_w(c)); }
+        if i < n_cols {
+            col_widths[i] = col_widths[i].max(cell_w(c));
+        }
     }
     for row in rows {
         for (i, c) in row.iter().enumerate() {
-            if i < n_cols { col_widths[i] = col_widths[i].max(cell_w(c)); }
+            if i < n_cols {
+                col_widths[i] = col_widths[i].max(cell_w(c));
+            }
         }
     }
 
@@ -1538,26 +1761,56 @@ fn layout_table(
         let scale = avail as f64 / total as f64;
         for w in col_widths.iter_mut() {
             *w = ((*w as f64) * scale).floor() as usize;
-            if *w == 0 { *w = 1; }
+            if *w == 0 {
+                *w = 1;
+            }
         }
     }
 
     let border = Style::default().fg(theme.muted);
 
     out_lines.push(border_line(&col_widths, '┌', '┬', '┐', border));
-    emit_row(theme, header, &col_widths, alignments, true, out_lines, out_links, links, border);
+    emit_row(
+        theme,
+        header,
+        &col_widths,
+        alignments,
+        true,
+        out_lines,
+        out_links,
+        links,
+        border,
+    );
     out_lines.push(border_line(&col_widths, '├', '┼', '┤', border));
     for row in rows {
-        emit_row(theme, row, &col_widths, alignments, false, out_lines, out_links, links, border);
+        emit_row(
+            theme,
+            row,
+            &col_widths,
+            alignments,
+            false,
+            out_lines,
+            out_links,
+            links,
+            border,
+        );
     }
     out_lines.push(border_line(&col_widths, '└', '┴', '┘', border));
 }
 
-fn border_line(col_widths: &[usize], left: char, mid: char, right: char, style: Style) -> Line<'static> {
+fn border_line(
+    col_widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    style: Style,
+) -> Line<'static> {
     let mut s = String::new();
     s.push(left);
     for (i, w) in col_widths.iter().enumerate() {
-        for _ in 0..(w + 2) { s.push('─'); }
+        for _ in 0..(w + 2) {
+            s.push('─');
+        }
         s.push(if i + 1 < col_widths.len() { mid } else { right });
     }
     Line::from(Span::styled(s, style))
@@ -1604,7 +1857,9 @@ fn emit_row(
         }
 
         // cell content
-        emit_runs_tracking_links(&truncated, is_header, theme, &mut spans, &mut col, line, out_links, links);
+        emit_runs_tracking_links(
+            &truncated, is_header, theme, &mut spans, &mut col, line, out_links, links,
+        );
 
         if rpad > 0 {
             spans.push(Span::raw(" ".repeat(rpad)));
@@ -1623,7 +1878,9 @@ fn emit_row(
 
 fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
     let total: usize = runs.iter().map(|r| r.text.width()).sum();
-    if total <= max { return runs.to_vec(); }
+    if total <= max {
+        return runs.to_vec();
+    }
     let mut out: Vec<Run> = Vec::new();
     let mut budget = max.saturating_sub(1); // reserve 1 for ellipsis
     for run in runs {
@@ -1637,7 +1894,9 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
             let mut taken_bytes = 0usize;
             for (i, ch) in run.text.char_indices() {
                 let cw = ch.to_string().width();
-                if taken_w + cw > budget { break; }
+                if taken_w + cw > budget {
+                    break;
+                }
                 taken_w += cw;
                 taken_bytes = i + ch.len_utf8();
             }
@@ -1660,7 +1919,9 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
         style: Style::default(),
         link: None,
         checkbox: None,
-        image: None, inline_range: None, cursor_at: None
+        image: None,
+        inline_range: None,
+        cursor_at: None,
     });
     out
 }
@@ -1725,7 +1986,10 @@ mod tests {
         assert!(!r.lines.is_empty());
         assert_eq!(r.link_map.links.len(), 1);
         let link = &r.link_map.links[0];
-        assert_eq!(link.target, LinkTarget::Url("https://example.com".to_string()));
+        assert_eq!(
+            link.target,
+            LinkTarget::Url("https://example.com".to_string())
+        );
         assert!(link.col_end > link.col_start);
     }
 
@@ -1756,11 +2020,16 @@ mod tests {
         let mut frame_lines: Vec<String> = Vec::new();
         for line in &r.lines {
             let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            if s.starts_with('│') || s.starts_with('┌') || s.starts_with('├') || s.starts_with('└') {
+            if s.starts_with('│') || s.starts_with('┌') || s.starts_with('├') || s.starts_with('└')
+            {
                 frame_lines.push(s);
             }
         }
-        assert!(frame_lines.len() >= 6, "expected ≥6 framed lines, got {}", frame_lines.len());
+        assert!(
+            frame_lines.len() >= 6,
+            "expected ≥6 framed lines, got {}",
+            frame_lines.len()
+        );
         // All framed lines must share the same display width — that's the alignment guarantee.
         let widths: Vec<usize> = frame_lines.iter().map(|s| s.as_str().width()).collect();
         assert!(

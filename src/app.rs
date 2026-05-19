@@ -207,8 +207,7 @@ impl Selection {
     }
     /// True if the selection covers any non-empty range.
     pub fn is_active(&self) -> bool {
-        self.dragged
-            && (self.anchor_line != self.focus_line || self.anchor_col != self.focus_col)
+        self.dragged && (self.anchor_line != self.focus_line || self.anchor_col != self.focus_col)
     }
 }
 
@@ -458,8 +457,7 @@ impl App {
                 Ok(true)
             }
             LinkTarget::LocalFile(p) => {
-                let resolved = match resolve_local_path(&p)
-                    .or_else(|| vault_lookup(&self.root, &p))
+                let resolved = match resolve_local_path(&p).or_else(|| vault_lookup(&self.root, &p))
                 {
                     Some(r) => r,
                     None => {
@@ -480,8 +478,7 @@ impl App {
                 }
             }
             LinkTarget::FileAnchor(p, slug) => {
-                let resolved = match resolve_local_path(&p)
-                    .or_else(|| vault_lookup(&self.root, &p))
+                let resolved = match resolve_local_path(&p).or_else(|| vault_lookup(&self.root, &p))
                 {
                     Some(r) => r,
                     None => {
@@ -520,23 +517,35 @@ impl App {
     /// when the on-screen content actually changed (mtime touched but byte-
     /// identical content does not count). No-op for stdin or non-Reader views.
     pub fn poll_external_change(&mut self) -> bool {
-        let View::Reader(r) = &mut self.view else { return false };
+        let View::Reader(r) = &mut self.view else {
+            return false;
+        };
         // Don't clobber an in-flight edit. The user can resolve any conflict
         // explicitly by saving (overwrites disk) or discarding via Esc-Esc
         // (reloads from disk).
-        if r.edit.is_some() { return false; }
+        if r.edit.is_some() {
+            return false;
+        }
         let path = match &r.origin {
             ReaderOrigin::File(p) => p.clone(),
             ReaderOrigin::Stdin => return false,
         };
-        let Some(new_meta) = file_meta(&path) else { return false };
-        if r.last_meta.as_ref() == Some(&new_meta) { return false; }
+        let Some(new_meta) = file_meta(&path) else {
+            return false;
+        };
+        if r.last_meta.as_ref() == Some(&new_meta) {
+            return false;
+        }
         // Fingerprint moved — re-read and decide whether content actually
         // changed. A transient read failure (editor mid-rename, etc.) is
         // ignored; we'll retry on the next tick.
-        let Ok(new_raw) = std::fs::read_to_string(&path) else { return false };
+        let Ok(new_raw) = std::fs::read_to_string(&path) else {
+            return false;
+        };
         r.last_meta = Some(new_meta);
-        if new_raw == r.raw { return false; }
+        if new_raw == r.raw {
+            return false;
+        }
         r.raw = new_raw;
         r.rendered = None;
         r.hover_link = None;
@@ -554,12 +563,20 @@ impl App {
     /// No-op for stdin sources. Drops the cached render so the next draw
     /// reflects the new state.
     pub fn toggle_checkbox(&mut self, idx: usize) -> Result<()> {
-        let View::Reader(r) = &mut self.view else { return Ok(()); };
-        let Some(rendered) = r.rendered.as_ref() else { return Ok(()); };
-        let Some(cb) = rendered.checkbox_map.items.get(idx) else { return Ok(()); };
+        let View::Reader(r) = &mut self.view else {
+            return Ok(());
+        };
+        let Some(rendered) = r.rendered.as_ref() else {
+            return Ok(());
+        };
+        let Some(cb) = rendered.checkbox_map.items.get(idx) else {
+            return Ok(());
+        };
         let offset = cb.source_offset;
         let was_checked = cb.checked;
-        if offset + 3 > r.raw.len() { return Ok(()); }
+        if offset + 3 > r.raw.len() {
+            return Ok(());
+        }
         let replacement = if was_checked { "[ ]" } else { "[x]" };
         let mut new_raw = String::with_capacity(r.raw.len());
         new_raw.push_str(&r.raw[..offset]);
@@ -573,7 +590,11 @@ impl App {
             // Refresh fingerprint so the watcher doesn't see our own write
             // as an external change and trigger a redundant reload.
             r.last_meta = file_meta(&path);
-            self.status = if was_checked { "Unchecked".into() } else { "Checked".into() };
+            self.status = if was_checked {
+                "Unchecked".into()
+            } else {
+                "Checked".into()
+            };
         } else {
             self.status = "Toggled (in-memory; stdin not persisted)".into();
         }
@@ -604,18 +625,31 @@ impl App {
 
     /// Recompute matches from the rendered document for the current query.
     pub fn doc_search_refresh(&mut self) {
-        let View::Reader(r) = &mut self.view else { return; };
-        let Some(rendered) = r.rendered.as_ref() else { return; };
-        let Some(s) = r.doc_search.as_mut() else { return; };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(rendered) = r.rendered.as_ref() else {
+            return;
+        };
+        let Some(s) = r.doc_search.as_mut() else {
+            return;
+        };
         s.matches = find_doc_matches(&rendered.lines, &s.query);
-        if s.matches.is_empty() { s.current = 0; }
-        else if s.current >= s.matches.len() { s.current = 0; }
+        if s.matches.is_empty() {
+            s.current = 0;
+        } else if s.current >= s.matches.len() {
+            s.current = 0;
+        }
     }
 
     /// Confirm the current query (close prompt, jump to first match).
     pub fn doc_search_commit(&mut self) {
-        let View::Reader(r) = &mut self.view else { return; };
-        let Some(s) = r.doc_search.as_mut() else { return; };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(s) = r.doc_search.as_mut() else {
+            return;
+        };
         s.editing = false;
         if s.matches.is_empty() {
             self.status = "No matches".into();
@@ -627,9 +661,15 @@ impl App {
 
     /// Step to the next/previous match (after commit).
     pub fn doc_search_step(&mut self, forward: bool) {
-        let View::Reader(r) = &mut self.view else { return; };
-        let Some(s) = r.doc_search.as_mut() else { return; };
-        if s.matches.is_empty() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(s) = r.doc_search.as_mut() else {
+            return;
+        };
+        if s.matches.is_empty() {
+            return;
+        }
         let n = s.matches.len();
         s.current = if forward {
             (s.current + 1) % n
@@ -641,9 +681,15 @@ impl App {
 
     fn center_on_doc_match(&mut self) {
         let h = self.viewport.height as usize;
-        let View::Reader(r) = &mut self.view else { return; };
-        let Some(s) = r.doc_search.as_ref() else { return; };
-        let Some(m) = s.matches.get(s.current) else { return; };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(s) = r.doc_search.as_ref() else {
+            return;
+        };
+        let Some(m) = s.matches.get(s.current) else {
+            return;
+        };
         let new = m.line.saturating_sub(h / 2);
         let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
         let max_scroll = total.saturating_sub(h);
@@ -679,7 +725,9 @@ impl App {
         match run_git_diff(&path) {
             Ok(diff) => {
                 let rows = parse_unified_diff(&diff);
-                let clean = rows.iter().all(|r| matches!(r.kind, DiffRowKind::Header | DiffRowKind::Info));
+                let clean = rows
+                    .iter()
+                    .all(|r| matches!(r.kind, DiffRowKind::Header | DiffRowKind::Info));
                 let rows = if clean {
                     vec![DiffRow {
                         kind: DiffRowKind::Info,
@@ -736,7 +784,9 @@ impl App {
     /// to drop any unsaved edits, then returns the reader to view mode.
     pub fn exit_edit_discard(&mut self) {
         if let View::Reader(r) = &mut self.view {
-            if r.edit.is_none() { return; }
+            if r.edit.is_none() {
+                return;
+            }
             if let ReaderOrigin::File(path) = r.origin.clone() {
                 if let Ok(disk) = std::fs::read_to_string(&path) {
                     r.raw = disk;
@@ -762,8 +812,12 @@ impl App {
     /// Insert `text` at the current edit cursor and advance the cursor past
     /// it. Marks dirty. No-op outside edit mode.
     pub fn edit_insert(&mut self, text: &str) {
-        let View::Reader(r) = &mut self.view else { return };
-        if r.edit.is_none() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
         push_undo(r);
         let e = r.edit.as_mut().unwrap();
         let pos = e.cursor.min(r.raw.len());
@@ -780,9 +834,13 @@ impl App {
     /// Delete `n` chars to the left of the cursor (Backspace). No-op if
     /// the cursor is at byte 0.
     pub fn edit_backspace(&mut self) {
-        let View::Reader(r) = &mut self.view else { return };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
         let Some(e) = r.edit.as_ref() else { return };
-        if e.cursor == 0 { return; }
+        if e.cursor == 0 {
+            return;
+        }
         push_undo(r);
         let e = r.edit.as_mut().unwrap();
         let end = floor_char_boundary(&r.raw, e.cursor);
@@ -797,11 +855,17 @@ impl App {
 
     /// Delete one char to the right of the cursor (Delete key).
     pub fn edit_delete(&mut self) {
-        let View::Reader(r) = &mut self.view else { return };
-        if r.edit.is_none() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
         let e = r.edit.as_ref().unwrap();
         let pos = floor_char_boundary(&r.raw, e.cursor);
-        if pos >= r.raw.len() { return; }
+        if pos >= r.raw.len() {
+            return;
+        }
         push_undo(r);
         let next = next_char_boundary(&r.raw, pos);
         r.raw.replace_range(pos..next, "");
@@ -814,8 +878,12 @@ impl App {
     /// Undo the last edit. Pops a snapshot off the undo stack, pushes the
     /// current state to redo, and restores raw + cursor.
     pub fn edit_undo(&mut self) {
-        let View::Reader(r) = &mut self.view else { return };
-        if r.edit.is_none() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
         let e = r.edit.as_mut().unwrap();
         let Some(snap) = e.undo.pop() else { return };
         // Save current as redo entry.
@@ -824,7 +892,10 @@ impl App {
         // Restore.
         r.raw = snap.raw;
         let e = r.edit.as_mut().unwrap();
-        e.redo.push(EditSnapshot { raw: cur_raw, cursor: cur_cursor });
+        e.redo.push(EditSnapshot {
+            raw: cur_raw,
+            cursor: cur_cursor,
+        });
         e.cursor = snap.cursor.min(r.raw.len());
         e.dirty = true; // Even after undo, the buffer differs from disk usually.
         e.discard_pending = false;
@@ -833,16 +904,25 @@ impl App {
 
     /// Redo a previously undone edit.
     pub fn edit_redo(&mut self) {
-        let View::Reader(r) = &mut self.view else { return };
-        if r.edit.is_none() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
         let e = r.edit.as_mut().unwrap();
         let Some(snap) = e.redo.pop() else { return };
         let cur_cursor = e.cursor;
         let cur_raw = std::mem::take(&mut r.raw);
         r.raw = snap.raw;
         let e = r.edit.as_mut().unwrap();
-        e.undo.push(EditSnapshot { raw: cur_raw, cursor: cur_cursor });
-        if e.undo.len() > UNDO_LIMIT { e.undo.remove(0); }
+        e.undo.push(EditSnapshot {
+            raw: cur_raw,
+            cursor: cur_cursor,
+        });
+        if e.undo.len() > UNDO_LIMIT {
+            e.undo.remove(0);
+        }
         e.cursor = snap.cursor.min(r.raw.len());
         e.dirty = true;
         e.discard_pending = false;
@@ -854,7 +934,9 @@ impl App {
     /// whitespace adjacent to the cursor, then through the next non-
     /// whitespace run, landing on the far edge.
     pub fn edit_move_word(&mut self, delta: i32) {
-        let View::Reader(r) = &mut self.view else { return };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
         let pos = floor_char_boundary(&r.raw, e.cursor);
@@ -873,8 +955,12 @@ impl App {
     /// `forward = true` deletes rightward (Alt-Delete), `false` deletes
     /// leftward (Alt-Backspace). One undo snapshot per call.
     pub fn edit_delete_word(&mut self, forward: bool) {
-        let View::Reader(r) = &mut self.view else { return };
-        if r.edit.is_none() { return; }
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
         let cur = r.edit.as_ref().unwrap().cursor;
         let pos = floor_char_boundary(&r.raw, cur);
         let (from, to) = if forward {
@@ -884,7 +970,9 @@ impl App {
             let from = prev_word_boundary(&r.raw, pos);
             (from, pos)
         };
-        if from == to { return; }
+        if from == to {
+            return;
+        }
         push_undo(r);
         r.raw.replace_range(from..to, "");
         let e = r.edit.as_mut().unwrap();
@@ -897,7 +985,9 @@ impl App {
     /// Move cursor by one char left/right (`delta` ±1). Re-renders so the
     /// block-level toggle can swap blocks if the cursor crossed a boundary.
     pub fn edit_move_horizontal(&mut self, delta: i32) {
-        let View::Reader(r) = &mut self.view else { return };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
         let pos = floor_char_boundary(&r.raw, e.cursor);
@@ -924,7 +1014,9 @@ impl App {
         );
         if split_mode {
             let raw_w = self.edit_raw_area.width.max(1) as usize;
-            let View::Reader(r) = &mut self.view else { return };
+            let View::Reader(r) = &mut self.view else {
+                return;
+            };
             let Some(e) = r.edit.as_mut() else { return };
             e.discard_pending = false;
             let cursor = e.cursor;
@@ -932,7 +1024,8 @@ impl App {
             let cur_idx = raw_row_for_cursor(&rows, cursor);
             let target_idx = (cur_idx as i32 + delta).max(0) as usize;
             let target_idx = target_idx.min(rows.len().saturating_sub(1));
-            let cur_col = rows.get(cur_idx)
+            let cur_col = rows
+                .get(cur_idx)
                 .map(|row| raw_col_for_cursor(&r.raw, row, cursor))
                 .unwrap_or(0) as usize;
             let new = raw_click_to_source(&rows, &r.raw, target_idx, cur_col);
@@ -945,7 +1038,9 @@ impl App {
 
         // Legacy InPlace mode: step display rows of the active raw block,
         // falling back to source-line stepping when crossing block bounds.
-        let View::Reader(r) = &mut self.view else { return };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
         if let Some(rendered) = r.rendered.as_ref() {
@@ -980,13 +1075,19 @@ impl App {
         );
         if split_mode {
             let raw_w = self.edit_raw_area.width.max(1) as usize;
-            let View::Reader(r) = &mut self.view else { return };
+            let View::Reader(r) = &mut self.view else {
+                return;
+            };
             let Some(e) = r.edit.as_mut() else { return };
             e.discard_pending = false;
             let rows = render_raw_pane(&r.raw, raw_w);
             let cur_idx = raw_row_for_cursor(&rows, e.cursor);
             let new = if let Some(row) = rows.get(cur_idx) {
-                if eol { row.source_range.end } else { row.source_range.start }
+                if eol {
+                    row.source_range.end
+                } else {
+                    row.source_range.start
+                }
             } else {
                 e.cursor
             };
@@ -997,7 +1098,9 @@ impl App {
             return;
         }
 
-        let View::Reader(r) = &mut self.view else { return };
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
         let Some(e) = r.edit.as_mut() else { return };
         e.discard_pending = false;
         let (line_idx, _col) = source_line_col(&r.raw, e.cursor);
@@ -1016,11 +1119,16 @@ impl App {
     /// so the external-change watcher doesn't see our own write as a phantom
     /// edit on the next tick.
     pub fn save_edit(&mut self) -> Result<()> {
-        let View::Reader(r) = &mut self.view else { return Ok(()); };
-        if r.edit.is_none() { return Ok(()); }
-        let ReaderOrigin::File(path) = r.origin.clone() else { return Ok(()); };
-        std::fs::write(&path, &r.raw)
-            .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+        let View::Reader(r) = &mut self.view else {
+            return Ok(());
+        };
+        if r.edit.is_none() {
+            return Ok(());
+        }
+        let ReaderOrigin::File(path) = r.origin.clone() else {
+            return Ok(());
+        };
+        std::fs::write(&path, &r.raw).map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
         r.last_meta = file_meta(&path);
         if let Some(e) = r.edit.as_mut() {
             e.dirty = false;
@@ -1038,7 +1146,11 @@ impl App {
     pub fn ensure_rendered(&mut self, width: u16) {
         let theme = self.opts.theme.clone();
         let user_width = self.opts.width;
-        let target_w = if user_width == 0 { width } else { user_width.min(width) };
+        let target_w = if user_width == 0 {
+            width
+        } else {
+            user_width.min(width)
+        };
         if let View::Reader(r) = &mut self.view {
             let needs = match &r.rendered {
                 Some(rd) => rd.width != target_w || r.edit.is_some(),
@@ -1067,11 +1179,19 @@ impl App {
                 ));
                 if let Some(rd) = &r.rendered {
                     let max_scroll = rd.lines.len().saturating_sub(1) as u16;
-                    if r.preview_scroll > max_scroll { r.preview_scroll = max_scroll; }
+                    if r.preview_scroll > max_scroll {
+                        r.preview_scroll = max_scroll;
+                    }
                     // In split mode `r.scroll` is the raw-pane scroll; raw
                     // wrap is computed at draw time so we can't clamp here.
-                    let in_split = r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false);
-                    if !in_split && r.scroll > max_scroll { r.scroll = max_scroll; }
+                    let in_split = r
+                        .edit
+                        .as_ref()
+                        .map(|e| e.mode == EditMode::Split)
+                        .unwrap_or(false);
+                    if !in_split && r.scroll > max_scroll {
+                        r.scroll = max_scroll;
+                    }
                 }
             }
         }
@@ -1093,7 +1213,12 @@ fn derive_root(source: &Source) -> PathBuf {
 pub fn is_markdown_file(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd"))
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -1130,14 +1255,22 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
         .require_git(false)
         .build();
     for result in walker {
-        let entry = match result { Ok(e) => e, Err(_) => continue };
-        if entry.path() == dir { continue; }
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.path() == dir {
+            continue;
+        }
         let name = match entry.file_name().to_str() {
             Some(n) => n.to_string(),
             None => continue,
         };
         let path = entry.path().to_path_buf();
-        let ft = match entry.file_type() { Some(f) => f, None => continue };
+        let ft = match entry.file_type() {
+            Some(f) => f,
+            None => continue,
+        };
         if ft.is_dir() {
             dirs.push((name, path));
         } else if ft.is_file() && is_markdown_file(&path) {
@@ -1168,12 +1301,11 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
 /// Case-insensitive substring search across the rendered lines, mapped to
 /// (line, col_start, col_end) in display-width coordinates so the highlight
 /// aligns with what the user sees.
-pub fn find_doc_matches(
-    lines: &[ratatui::text::Line<'static>],
-    query: &str,
-) -> Vec<DocMatch> {
+pub fn find_doc_matches(lines: &[ratatui::text::Line<'static>], query: &str) -> Vec<DocMatch> {
     let mut out = Vec::new();
-    if query.is_empty() { return out; }
+    if query.is_empty() {
+        return out;
+    }
     let q = query.to_ascii_lowercase();
     for (line_idx, line) in lines.iter().enumerate() {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1184,7 +1316,11 @@ pub fn find_doc_matches(
             let col_start = unicode_width::UnicodeWidthStr::width(&text[..abs]);
             let end_byte = abs + q.len();
             let col_end = unicode_width::UnicodeWidthStr::width(&text[..end_byte]);
-            out.push(DocMatch { line: line_idx, col_start, col_end });
+            out.push(DocMatch {
+                line: line_idx,
+                col_start,
+                col_end,
+            });
             from = end_byte.max(abs + 1);
         }
     }
@@ -1196,7 +1332,11 @@ pub fn find_doc_matches(
 /// first hit. Bounded depth and skips dotfiles to avoid pathological scans.
 fn vault_lookup(root: &Path, target: &Path) -> Option<PathBuf> {
     let needle = target.file_name()?.to_str()?.to_string();
-    let needle_md = if needle.contains('.') { needle.clone() } else { format!("{}.md", needle) };
+    let needle_md = if needle.contains('.') {
+        needle.clone()
+    } else {
+        format!("{}.md", needle)
+    };
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(8)
@@ -1209,8 +1349,13 @@ fn vault_lookup(root: &Path, target: &Path) -> Option<PathBuf> {
         })
         .filter_map(|e| e.ok())
     {
-        if !entry.file_type().is_file() { continue; }
-        let name = match entry.file_name().to_str() { Some(n) => n, None => continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(n) => n,
+            None => continue,
+        };
         if name == needle || name == needle_md {
             return Some(canonicalize_or(entry.path().to_path_buf()));
         }
@@ -1225,8 +1370,8 @@ impl Reader {
         // actual mtime and the next watcher tick will reload. The other order
         // would silently swallow the concurrent edit.
         let last_meta = file_meta(path);
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
         Ok(Self {
             origin: ReaderOrigin::File(path.to_path_buf()),
             raw,
@@ -1247,7 +1392,9 @@ impl Reader {
     /// highlight the focused element without re-deriving the position.
     pub fn focus_targets(&self) -> Vec<(Focus, usize, usize)> {
         let mut out: Vec<(Focus, usize, usize)> = Vec::new();
-        let Some(rd) = self.rendered.as_ref() else { return out };
+        let Some(rd) = self.rendered.as_ref() else {
+            return out;
+        };
         for (i, l) in rd.link_map.links.iter().enumerate() {
             out.push((Focus::Link(i), l.line, l.col_start));
         }
@@ -1306,7 +1453,11 @@ fn run_git_diff(path: &Path) -> std::result::Result<String, String> {
         // `git diff` returns 0 with no output when there are no changes.
         // A non-zero exit means a real failure (not in a repo, etc.).
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if err.is_empty() { format!("exit {}", output.status) } else { err });
+        return Err(if err.is_empty() {
+            format!("exit {}", output.status)
+        } else {
+            err
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1320,7 +1471,15 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffRow> {
     for line in diff.lines() {
         let kind = if line.starts_with("@@") {
             DiffRowKind::Hunk
-        } else if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") || line.starts_with("new file") || line.starts_with("deleted file") || line.starts_with("rename ") || line.starts_with("similarity ") {
+        } else if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+        {
             DiffRowKind::Header
         } else if line.starts_with('+') {
             DiffRowKind::Added
@@ -1329,7 +1488,10 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffRow> {
         } else {
             DiffRowKind::Context
         };
-        out.push(DiffRow { kind, text: line.to_string() });
+        out.push(DiffRow {
+            kind,
+            text: line.to_string(),
+        });
     }
     out
 }
@@ -1339,7 +1501,10 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffRow> {
 /// Caps the undo stack at `UNDO_LIMIT` entries (FIFO eviction).
 fn push_undo(r: &mut Reader) {
     let Some(e) = r.edit.as_mut() else { return };
-    e.undo.push(EditSnapshot { raw: r.raw.clone(), cursor: e.cursor });
+    e.undo.push(EditSnapshot {
+        raw: r.raw.clone(),
+        cursor: e.cursor,
+    });
     if e.undo.len() > UNDO_LIMIT {
         e.undo.remove(0);
     }
@@ -1348,7 +1513,9 @@ fn push_undo(r: &mut Reader) {
 
 /// Snap `pos` down to the nearest UTF-8 char boundary <= pos.
 fn floor_char_boundary(s: &str, pos: usize) -> usize {
-    if pos >= s.len() { return s.len(); }
+    if pos >= s.len() {
+        return s.len();
+    }
     let mut p = pos;
     while p > 0 && !s.is_char_boundary(p) {
         p -= 1;
@@ -1359,7 +1526,9 @@ fn floor_char_boundary(s: &str, pos: usize) -> usize {
 /// Byte offset of the next char boundary strictly after `pos`. Returns
 /// `s.len()` if `pos` is already at end.
 fn next_char_boundary(s: &str, pos: usize) -> usize {
-    if pos >= s.len() { return s.len(); }
+    if pos >= s.len() {
+        return s.len();
+    }
     let mut p = pos + 1;
     while p < s.len() && !s.is_char_boundary(p) {
         p += 1;
@@ -1370,7 +1539,9 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 /// Byte offset of the previous char boundary strictly before `pos`. Returns
 /// 0 if `pos` is already at the start.
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
-    if pos == 0 { return 0; }
+    if pos == 0 {
+        return 0;
+    }
     let mut p = pos - 1;
     while p > 0 && !s.is_char_boundary(p) {
         p -= 1;
@@ -1392,7 +1563,9 @@ fn source_line_col(s: &str, pos: usize) -> (usize, usize) {
 /// Byte offset of the first char of `line`. Out-of-range lines return
 /// `s.len()`.
 fn source_line_start(s: &str, line: usize) -> usize {
-    if line == 0 { return 0; }
+    if line == 0 {
+        return 0;
+    }
     let mut count = 0;
     for (i, b) in s.bytes().enumerate() {
         if b == b'\n' {
@@ -1409,10 +1582,7 @@ fn source_line_start(s: &str, line: usize) -> usize {
 /// the trailing `\n`, or `s.len()` for the last line).
 fn source_line_end(s: &str, line: usize) -> usize {
     let start = source_line_start(s, line);
-    s[start..]
-        .find('\n')
-        .map(|i| start + i)
-        .unwrap_or(s.len())
+    s[start..].find('\n').map(|i| start + i).unwrap_or(s.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,7 +1610,9 @@ pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
     // Iterate `\n`-delimited source lines; `split('\n')` yields the trailing
     // empty if `raw` ends with `\n`, which gives us the empty row at EOF.
     let mut lines: Vec<&str> = raw.split('\n').collect();
-    if raw.is_empty() { lines = vec![""]; }
+    if raw.is_empty() {
+        lines = vec![""];
+    }
     for (i, line) in lines.iter().enumerate() {
         let line_start = byte;
         let line_len = line.len();
@@ -1473,7 +1645,9 @@ pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
 /// Find the raw-pane row index containing `cursor` (or the last row when
 /// the cursor sits at EOF).
 pub fn raw_row_for_cursor(rows: &[RawRow], cursor: usize) -> usize {
-    if rows.is_empty() { return 0; }
+    if rows.is_empty() {
+        return 0;
+    }
     for (i, row) in rows.iter().enumerate() {
         // A cursor on the boundary between two rows belongs to the *next*
         // row when there's a wrap-break (no `\n`); but the first row that
@@ -1485,7 +1659,8 @@ pub fn raw_row_for_cursor(rows: &[RawRow], cursor: usize) -> usize {
             // boundary, except at end of the row when the next row starts
             // at the same position (wrap break) — then bump to the next.
             let at_end = cursor == row.source_range.end;
-            let next_starts_here = rows.get(i + 1)
+            let next_starts_here = rows
+                .get(i + 1)
                 .map(|nr| nr.source_range.start == cursor)
                 .unwrap_or(false);
             if at_end && next_starts_here {
@@ -1503,7 +1678,9 @@ pub fn raw_col_for_cursor(raw: &str, row: &RawRow, cursor: usize) -> u16 {
     use unicode_width::UnicodeWidthChar;
     let start = row.source_range.start;
     let end = row.source_range.end.min(cursor);
-    if cursor < start { return 0; }
+    if cursor < start {
+        return 0;
+    }
     let slice = match raw.get(start..end) {
         Some(s) => s,
         None => return 0,
@@ -1521,7 +1698,9 @@ pub fn raw_click_to_source(rows: &[RawRow], raw: &str, row: usize, col: usize) -
     let mut taken = 0usize;
     for (i, ch) in slice.char_indices() {
         let w = ch.width().unwrap_or(0);
-        if taken + w > col { return r.source_range.start + i; }
+        if taken + w > col {
+            return r.source_range.start + i;
+        }
         taken += w;
     }
     r.source_range.end
@@ -1534,7 +1713,11 @@ pub fn preview_row_for_source(rendered: &Rendered, cursor: usize) -> usize {
     // Find the block whose source range contains the cursor.
     for b in &rendered.blocks {
         if cursor >= b.source_range.start && cursor < b.source_range.end {
-            let span = b.source_range.end.saturating_sub(b.source_range.start).max(1);
+            let span = b
+                .source_range
+                .end
+                .saturating_sub(b.source_range.start)
+                .max(1);
             let off = cursor.saturating_sub(b.source_range.start);
             let h = b.display_end.saturating_sub(b.display_start);
             let row_in_block = (off * h) / span;
@@ -1576,12 +1759,16 @@ fn next_word_boundary(s: &str, pos: usize) -> usize {
     let len = s.len();
     while i < len {
         let ch = s[i..].chars().next().unwrap();
-        if !ch.is_whitespace() { break; }
+        if !ch.is_whitespace() {
+            break;
+        }
         i += ch.len_utf8();
     }
     while i < len {
         let ch = s[i..].chars().next().unwrap();
-        if ch.is_whitespace() { break; }
+        if ch.is_whitespace() {
+            break;
+        }
         i += ch.len_utf8();
     }
     i
@@ -1593,12 +1780,16 @@ fn prev_word_boundary(s: &str, pos: usize) -> usize {
     let mut i = pos.min(s.len());
     while i > 0 {
         let prev = s[..i].chars().next_back().unwrap();
-        if !prev.is_whitespace() { break; }
+        if !prev.is_whitespace() {
+            break;
+        }
         i -= prev.len_utf8();
     }
     while i > 0 {
         let prev = s[..i].chars().next_back().unwrap();
-        if prev.is_whitespace() { break; }
+        if prev.is_whitespace() {
+            break;
+        }
         i -= prev.len_utf8();
     }
     i
@@ -1610,7 +1801,9 @@ fn prev_word_boundary(s: &str, pos: usize) -> usize {
 /// display-row, not source-line by source-line.
 fn source_offset_at_col(s: &str, range: &std::ops::Range<usize>, col: usize) -> usize {
     use unicode_width::UnicodeWidthChar;
-    let Some(slice) = s.get(range.clone()) else { return range.start };
+    let Some(slice) = s.get(range.clone()) else {
+        return range.start;
+    };
     let mut taken = 0usize;
     for (i, ch) in slice.char_indices() {
         let w = ch.width().unwrap_or(0);
@@ -1630,9 +1823,17 @@ fn source_offset_for(s: &str, line: usize, col: usize) -> usize {
     let mut taken = 0usize;
     let mut last = start;
     for (i, _ch) in line_str.char_indices() {
-        if taken == col { return start + i; }
+        if taken == col {
+            return start + i;
+        }
         taken += 1;
-        last = start + i + line_str[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        last = start
+            + i
+            + line_str[i..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
     }
     last.min(end)
 }
@@ -1688,7 +1889,11 @@ impl Browser {
             .position(|e| !matches!(e.kind, BrowserEntryKind::ParentDir))
             .unwrap_or(0);
         self.selected = match prev_selected_path {
-            Some(p) => self.entries.iter().position(|e| e.path == p).unwrap_or(first_real),
+            Some(p) => self
+                .entries
+                .iter()
+                .position(|e| e.path == p)
+                .unwrap_or(first_real),
             None => first_real,
         };
         Ok(())
@@ -1713,8 +1918,13 @@ impl Search {
             .require_git(false)
             .build();
         for result in walker {
-            let entry = match result { Ok(e) => e, Err(_) => continue };
-            if entry.path() == root { continue; }
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.path() == root {
+                continue;
+            }
             let display = entry
                 .path()
                 .strip_prefix(root)
@@ -1753,9 +1963,11 @@ impl Search {
                 });
             }
             self.results.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then(a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()))
+                b.is_dir.cmp(&a.is_dir).then(
+                    a.display
+                        .to_ascii_lowercase()
+                        .cmp(&b.display.to_ascii_lowercase()),
+                )
             });
         } else {
             for ip in &self.paths {
@@ -1769,9 +1981,11 @@ impl Search {
                 }
             }
             self.results.sort_by(|a, b| {
-                b.score
-                    .cmp(&a.score)
-                    .then(a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()))
+                b.score.cmp(&a.score).then(
+                    a.display
+                        .to_ascii_lowercase()
+                        .cmp(&b.display.to_ascii_lowercase()),
+                )
             });
         }
         if self.selected >= self.results.len() {
@@ -1781,7 +1995,9 @@ impl Search {
 
     pub fn move_selection(&mut self, delta: i32) {
         let n = self.results.len() as i32;
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         let new = ((self.selected as i32 + delta) % n + n) % n;
         self.selected = new as usize;
     }
@@ -1826,7 +2042,11 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options { width: 80, line_numbers: false, theme: Theme::dark() }
+        Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        }
     }
 
     #[test]
@@ -1842,9 +2062,17 @@ mod tests {
         let b = Browser::scan(&dir).unwrap();
         let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
 
-        assert!(names.contains(&"subdir/"), "missing subdir, got {:?}", names);
+        assert!(
+            names.contains(&"subdir/"),
+            "missing subdir, got {:?}",
+            names
+        );
         assert!(names.contains(&"a.md"), "missing a.md, got {:?}", names);
-        assert!(names.contains(&"b.markdown"), "missing b.markdown, got {:?}", names);
+        assert!(
+            names.contains(&"b.markdown"),
+            "missing b.markdown, got {:?}",
+            names
+        );
         assert!(!names.contains(&"note.txt"));
         assert!(!names.contains(&"Cargo.toml"));
         assert!(names.iter().all(|n| !n.contains(".hidden")));
@@ -1914,7 +2142,10 @@ mod tests {
         // Rewrite identical content — mtime moves but content doesn't.
         std::fs::write(&path, "# same\n").unwrap();
 
-        assert!(!app.poll_external_change(), "no-op rewrite must not signal a reload");
+        assert!(
+            !app.poll_external_change(),
+            "no-op rewrite must not signal a reload"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2020,7 +2251,8 @@ mod tests {
         std::fs::write(dir.join("inner/note.md"), "# note").unwrap();
 
         let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
-        app.navigate_to(EntryKind::Directory(dir.join("inner")), 0).unwrap();
+        app.navigate_to(EntryKind::Directory(dir.join("inner")), 0)
+            .unwrap();
         match &app.view {
             View::Browser(b) => assert_eq!(b.dir, dir.join("inner")),
             _ => panic!("expected browser at inner/"),
@@ -2100,7 +2332,9 @@ mod tests {
         app.enter_edit();
         app.edit_insert("X");
 
-        let View::Reader(r) = &app.view else { panic!("expected reader") };
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
         assert_eq!(r.raw, "Xhello\n");
         let e = r.edit.as_ref().unwrap();
         assert!(e.dirty);
@@ -2169,14 +2403,26 @@ mod tests {
         // twice → buffer back to original.
         app.edit_insert("X");
         app.edit_insert("Y");
-        match &app.view { View::Reader(r) => assert_eq!(r.raw, "XYabc\n"), _ => panic!() };
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "XYabc\n"),
+            _ => panic!(),
+        };
         app.edit_undo();
-        match &app.view { View::Reader(r) => assert_eq!(r.raw, "Xabc\n"), _ => panic!() };
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "Xabc\n"),
+            _ => panic!(),
+        };
         app.edit_undo();
-        match &app.view { View::Reader(r) => assert_eq!(r.raw, "abc\n"), _ => panic!() };
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "abc\n"),
+            _ => panic!(),
+        };
         // Redo once → first edit reapplied.
         app.edit_redo();
-        match &app.view { View::Reader(r) => assert_eq!(r.raw, "Xabc\n"), _ => panic!() };
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "Xabc\n"),
+            _ => panic!(),
+        };
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2195,7 +2441,10 @@ mod tests {
             View::Reader(r) => {
                 assert_eq!(r.raw, "Ya\n");
                 let e = r.edit.as_ref().unwrap();
-                assert!(e.redo.is_empty(), "redo should be cleared after diverging edit");
+                assert!(
+                    e.redo.is_empty(),
+                    "redo should be cleared after diverging edit"
+                );
             }
             _ => panic!(),
         }
@@ -2265,7 +2514,11 @@ index abc..def 100644\n\
         // Cursor must land on a row > 0 (the line wrapped) AND its column
         // must be inside the body width.
         assert!(xy.1 > 0, "expected cursor on wrapped row, got {:?}", xy);
-        assert!(xy.0 < 40, "cursor col should fit within render width, got {:?}", xy);
+        assert!(
+            xy.0 < 40,
+            "cursor col should fit within render width, got {:?}",
+            xy
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2294,14 +2547,20 @@ index abc..def 100644\n\
             let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
             s.contains("# Heading")
         });
-        assert!(any_raw_heading, "expected raw heading line in rendered output");
+        assert!(
+            any_raw_heading,
+            "expected raw heading line in rendered output"
+        );
 
         // The other paragraph should remain formatted (no `#` markers).
         let any_raw_para_marker = rd.lines.iter().any(|l| {
             let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
             s.contains("# Second")
         });
-        assert!(!any_raw_para_marker, "second paragraph should stay formatted");
+        assert!(
+            !any_raw_para_marker,
+            "second paragraph should stay formatted"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2316,8 +2575,15 @@ index abc..def 100644\n\
         let b = Browser::scan(&dir).unwrap();
         // First entry is `../`; cursor should not start on it.
         assert!(matches!(b.entries[0].kind, BrowserEntryKind::ParentDir));
-        assert!(b.selected > 0, "expected to skip ../, got selected={}", b.selected);
-        assert!(!matches!(b.entries[b.selected].kind, BrowserEntryKind::ParentDir));
+        assert!(
+            b.selected > 0,
+            "expected to skip ../, got selected={}",
+            b.selected
+        );
+        assert!(!matches!(
+            b.entries[b.selected].kind,
+            BrowserEntryKind::ParentDir
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2365,7 +2631,9 @@ index abc..def 100644\n\
 
         let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
         app.ensure_rendered(80);
-        let View::Reader(r) = &app.view else { panic!("expected reader") };
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
 
         let targets = r.focus_targets();
         // Expect 4 items: cb0, link0 (same line as cb0), link1, cb1.
@@ -2377,7 +2645,12 @@ index abc..def 100644\n\
                 Focus::Checkbox(_) => "cb",
             })
             .collect();
-        assert_eq!(kinds, vec!["cb", "link", "link", "cb"], "ordering: {:?}", targets);
+        assert_eq!(
+            kinds,
+            vec!["cb", "link", "link", "cb"],
+            "ordering: {:?}",
+            targets
+        );
 
         // The lines must be monotonically non-decreasing.
         for w in targets.windows(2) {

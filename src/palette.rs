@@ -40,7 +40,10 @@ fn detect() -> ColorDepth {
         }
         // Known truecolor-capable terminal emulators that may not set
         // COLORTERM after env stripping.
-        if matches!(p.as_str(), "iTerm.app" | "vscode" | "WezTerm" | "ghostty" | "Hyper") {
+        if matches!(
+            p.as_str(),
+            "iTerm.app" | "vscode" | "WezTerm" | "ghostty" | "Hyper"
+        ) {
             return ColorDepth::TrueColor;
         }
     }
@@ -98,7 +101,11 @@ fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
     let gray_idx = 232 + gray_n;
     let gray_dist = sq_dist((r, g, b), (gray_v, gray_v, gray_v));
 
-    if gray_dist < cube_dist { gray_idx } else { cube as u8 }
+    if gray_dist < cube_dist {
+        gray_idx
+    } else {
+        cube as u8
+    }
 }
 
 fn sq_dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> i32 {
@@ -125,7 +132,11 @@ mod tests {
     #[test]
     fn mid_gray_uses_grayscale_ramp() {
         let idx = rgb_to_xterm256(128, 128, 128);
-        assert!((232..=255).contains(&idx), "expected grayscale, got {}", idx);
+        assert!(
+            (232..=255).contains(&idx),
+            "expected grayscale, got {}",
+            idx
+        );
     }
 
     #[test]

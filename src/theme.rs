@@ -120,7 +120,11 @@ impl Theme {
 }
 
 pub fn resolve(name: &str, cfg: &crate::config::Config) -> Theme {
-    let n = if name == "auto" { cfg.theme.as_deref().unwrap_or("auto") } else { name };
+    let n = if name == "auto" {
+        cfg.theme.as_deref().unwrap_or("auto")
+    } else {
+        name
+    };
     match n {
         "light" => Theme::light(),
         "dark" => Theme::dark(),
@@ -132,7 +136,9 @@ fn detect_terminal_theme() -> Theme {
     if let Ok(v) = std::env::var("COLORFGBG") {
         // Convention: "<fg>;<bg>" — bg 7-15 light, 0-6 dark
         if let Some(bg) = v.split(';').last().and_then(|s| s.parse::<u8>().ok()) {
-            if bg >= 7 { return Theme::light(); }
+            if bg >= 7 {
+                return Theme::light();
+            }
         }
     }
     Theme::dark()

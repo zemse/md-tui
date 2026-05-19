@@ -13,6 +13,8 @@ pub fn load() -> Config {
         Some(d) => d.join("md").join("config.toml"),
         None => return Config::default(),
     };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Config::default(); };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Config::default();
+    };
     toml::from_str(&text).unwrap_or_default()
 }

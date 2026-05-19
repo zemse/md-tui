@@ -64,7 +64,9 @@ impl CheckboxMap {
 impl LinkMap {
     /// Returns the index of the link containing (line, col), if any.
     pub fn at(&self, line: usize, col: usize) -> Option<usize> {
-        self.links.iter().position(|l| l.line == line && col >= l.col_start && col < l.col_end)
+        self.links
+            .iter()
+            .position(|l| l.line == line && col >= l.col_start && col < l.col_end)
     }
 
     /// First link on or after `line`.
@@ -92,7 +94,9 @@ pub fn resolve(dest: &str, base_dir: Option<&Path>) -> LinkTarget {
         return LinkTarget::Anchor(slugify(&dest[1..]));
     }
     if let Some((scheme, _)) = dest.split_once("://") {
-        if !scheme.is_empty() { return LinkTarget::Url(dest.to_string()); }
+        if !scheme.is_empty() {
+            return LinkTarget::Url(dest.to_string());
+        }
     }
     if dest.starts_with("mailto:") || dest.starts_with("tel:") {
         return LinkTarget::Url(dest.to_string());
@@ -148,7 +152,9 @@ pub fn slugify(s: &str) -> String {
     let mut prev_dash = false;
     for ch in s.chars() {
         if ch.is_alphanumeric() {
-            for c in ch.to_lowercase() { out.push(c); }
+            for c in ch.to_lowercase() {
+                out.push(c);
+            }
             prev_dash = false;
         } else if ch.is_whitespace() || ch == '-' || ch == '_' {
             if !prev_dash && !out.is_empty() {
@@ -157,6 +163,8 @@ pub fn slugify(s: &str) -> String {
             }
         }
     }
-    while out.ends_with('-') { out.pop(); }
+    while out.ends_with('-') {
+        out.pop();
+    }
     out
 }

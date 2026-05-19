@@ -20,10 +20,19 @@ fn themes() -> &'static ThemeSet {
 
 /// Highlight `code` and append styled spans to `out` line-by-line.
 /// Each input line becomes a separate `Vec<Span<'static>>` pushed to `out`.
-pub fn highlight(code: &str, lang_token: Option<&str>, theme_name: &str, out: &mut Vec<Vec<Span<'static>>>) {
+pub fn highlight(
+    code: &str,
+    lang_token: Option<&str>,
+    theme_name: &str,
+    out: &mut Vec<Vec<Span<'static>>>,
+) {
     let ss = syntaxes();
     let ts = themes();
-    let theme = ts.themes.get(theme_name).or_else(|| ts.themes.values().next()).unwrap();
+    let theme = ts
+        .themes
+        .get(theme_name)
+        .or_else(|| ts.themes.values().next())
+        .unwrap();
     let syntax = lang_token
         .and_then(|t| ss.find_syntax_by_token(t))
         .or_else(|| ss.find_syntax_by_first_line(code))
@@ -40,7 +49,9 @@ pub fn highlight(code: &str, lang_token: Option<&str>, theme_name: &str, out: &m
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (s, txt) in regions {
             let trimmed = txt.trim_end_matches('\n');
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             spans.push(Span::styled(trimmed.to_string(), syn_to_ratatui(s)));
         }
         out.push(spans);
@@ -48,9 +59,16 @@ pub fn highlight(code: &str, lang_token: Option<&str>, theme_name: &str, out: &m
 }
 
 fn syn_to_ratatui(s: SynStyle) -> Style {
-    let mut style = Style::default().fg(palette::rgb(s.foreground.r, s.foreground.g, s.foreground.b));
-    if s.font_style.contains(FontStyle::BOLD) { style = style.add_modifier(Modifier::BOLD); }
-    if s.font_style.contains(FontStyle::ITALIC) { style = style.add_modifier(Modifier::ITALIC); }
-    if s.font_style.contains(FontStyle::UNDERLINE) { style = style.add_modifier(Modifier::UNDERLINED); }
+    let mut style =
+        Style::default().fg(palette::rgb(s.foreground.r, s.foreground.g, s.foreground.b));
+    if s.font_style.contains(FontStyle::BOLD) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if s.font_style.contains(FontStyle::ITALIC) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if s.font_style.contains(FontStyle::UNDERLINE) {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
     style
 }
