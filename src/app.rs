@@ -808,8 +808,7 @@ impl App {
     }
 
     /// Exit edit mode without modifying the buffer. Used after a successful
-    /// save: the buffer is already what's on disk, so we just leave edit mode.
-    #[allow(dead_code)]
+    /// save and on Esc from a clean buffer (no edits to discard).
     pub fn exit_edit(&mut self) {
         if let View::Reader(r) = &mut self.view {
             r.edit = None;

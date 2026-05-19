@@ -399,13 +399,24 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     match key.code {
         KeyCode::Esc => {
-            // First Esc arms; second Esc discards. Anything else clears it
-            // (handled inside the mutation helpers via `discard_pending = false`).
-            let armed = matches!(
-                &app.view,
-                View::Reader(r) if r.edit.as_ref().map(|e| e.discard_pending).unwrap_or(false)
-            );
-            if armed {
+            // Esc semantics depend on whether there are unsaved changes:
+            //   - Clean buffer: single Esc exits edit mode (no arming, no
+            //     "discarded" status — there was nothing to discard).
+            //   - Dirty buffer: first Esc arms, second Esc discards. The
+            //     arm prompt lives in the statusline; any other key clears
+            //     it via `discard_pending = false` in mutation helpers.
+            let (dirty, armed) = match &app.view {
+                View::Reader(r) => r
+                    .edit
+                    .as_ref()
+                    .map(|e| (e.dirty, e.discard_pending))
+                    .unwrap_or((false, false)),
+                _ => (false, false),
+            };
+            if !dirty {
+                app.exit_edit();
+                app.status.clear();
+            } else if armed {
                 app.exit_edit_discard();
             } else if let View::Reader(r) = &mut app.view {
                 if let Some(e) = r.edit.as_mut() {
