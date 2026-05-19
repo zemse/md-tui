@@ -1,8 +1,8 @@
 [package]
 name = "md-tui-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Terminal markdown reader with mouse support, clickable links and task lists, fuzzy search, and a directory browser."
+description = "Terminal markdown reader and HackMD-style split-screen editor with mouse support, clickable links and task lists, fuzzy search, and a directory browser."
 license = "MIT"
 repository = "https://github.com/zemse/md-tui"
 homepage = "https://github.com/zemse/md-tui"
