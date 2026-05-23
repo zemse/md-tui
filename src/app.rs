@@ -138,6 +138,12 @@ pub struct Reader {
     /// event loop to detect external edits and reload. `None` for stdin or
     /// when the metadata wasn't available at load time.
     pub last_meta: Option<(std::time::SystemTime, u64)>,
+    /// Set when the source isn't markdown (e.g. .json, .rs, .txt). The string
+    /// is the syntect language token (empty = plain text). At render time we
+    /// wrap `raw` in a fenced code block so the existing markdown pipeline
+    /// gives us syntax highlighting for free. `raw` itself stays unwrapped so
+    /// editing and saving operate on the actual file content.
+    pub wrap_lang: Option<String>,
 }
 
 /// Default-active edit-mode UI. `Split` is the new HackMD-style two-pane
@@ -475,7 +481,7 @@ impl App {
                 if resolved.is_dir() {
                     self.navigate_to(EntryKind::Directory(resolved), 0)?;
                     Ok(true)
-                } else if is_markdown_file(&resolved) {
+                } else if is_text_file(&resolved) {
                     self.navigate_to(EntryKind::File(resolved), 0)?;
                     Ok(true)
                 } else {
@@ -1177,8 +1183,9 @@ impl App {
                     EditMode::Split => None,
                     EditMode::InPlace => Some(markdown::EditCtx { cursor: e.cursor }),
                 });
+                let source = r.render_source();
                 r.rendered = Some(markdown::render_with_edit(
-                    &r.raw,
+                    source.as_ref(),
                     base_dir.as_deref(),
                     target_w,
                     &theme,
@@ -1227,6 +1234,115 @@ pub fn is_markdown_file(p: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Any file we know how to render in the reader: markdown plus the curated
+/// set of text/code extensions handled by `lang_token_for_path`. The browser
+/// uses this to decide which files to list; the link-click path uses it to
+/// decide whether to open inside the TUI or hand off to `open::that_detached`.
+pub fn is_text_file(p: &Path) -> bool {
+    is_markdown_file(p) || known_text_extension(p)
+}
+
+fn known_text_extension(p: &Path) -> bool {
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        // Allow common extension-less text filenames (Makefile, Dockerfile,
+        // LICENSE, README, etc.) so they show up in the browser too.
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase());
+        return matches!(
+            name.as_deref(),
+            Some("dockerfile")
+                | Some("makefile")
+                | Some("gnumakefile")
+                | Some("license")
+                | Some("readme")
+                | Some("authors")
+                | Some("changelog")
+                | Some("todo")
+                | Some("notice")
+        );
+    };
+    !matches!(lang_token_for_ext(&ext.to_ascii_lowercase()), None)
+}
+
+/// Map a path to a syntect language token. Returns an empty string for
+/// recognized text formats without a dedicated highlighter (plain text /
+/// data formats), which makes syntect fall back to plain text. The empty
+/// string is also the fallback for unknown extensions on text files we
+/// chose to display anyway.
+pub fn lang_token_for_path(p: &Path) -> &'static str {
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        if let Some(tok) = lang_token_for_ext(&ext.to_ascii_lowercase()) {
+            return tok;
+        }
+    }
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase());
+    match name.as_deref() {
+        Some("dockerfile") => "dockerfile",
+        Some("makefile") | Some("gnumakefile") => "make",
+        _ => "",
+    }
+}
+
+fn lang_token_for_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "txt" | "text" | "log" => "",
+        "json" => "json",
+        "jsonl" | "ndjson" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "ini" | "conf" | "cfg" | "properties" | "env" => "ini",
+        "xml" | "svg" | "plist" => "xml",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" | "sass" => "scss",
+        "less" => "less",
+        "js" | "mjs" | "cjs" => "js",
+        "jsx" => "jsx",
+        "ts" => "ts",
+        "tsx" => "tsx",
+        "py" | "pyw" => "python",
+        "rb" => "ruby",
+        "php" => "php",
+        "pl" | "pm" => "perl",
+        "lua" => "lua",
+        "go" => "go",
+        "rs" => "rust",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "cs" => "c#",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "dart" => "dart",
+        "scala" => "scala",
+        "clj" | "cljs" | "cljc" => "clojure",
+        "ex" | "exs" => "elixir",
+        "erl" | "hrl" => "erlang",
+        "hs" => "haskell",
+        "ml" | "mli" => "ocaml",
+        "sh" | "bash" | "zsh" | "fish" => "bash",
+        "ps1" | "psm1" => "powershell",
+        "bat" | "cmd" => "batch",
+        "sql" => "sql",
+        "graphql" | "gql" => "",
+        "csv" | "tsv" => "",
+        "diff" | "patch" => "diff",
+        "dockerfile" => "dockerfile",
+        "mk" => "make",
+        "nix" => "",
+        "vim" => "vim",
+        "r" => "r",
+        "tex" | "ltx" => "latex",
+        "rst" => "",
+        _ => return None,
+    })
 }
 
 /// Resolve a local link's path: try as-is, then with a `.md` extension as a
@@ -1280,7 +1396,7 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
         };
         if ft.is_dir() {
             dirs.push((name, path));
-        } else if ft.is_file() && is_markdown_file(&path) {
+        } else if ft.is_file() && is_text_file(&path) {
             files.push((name, path));
         }
     }
@@ -1379,6 +1495,11 @@ impl Reader {
         let last_meta = file_meta(path);
         let raw =
             std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+        let wrap_lang = if is_markdown_file(path) {
+            None
+        } else {
+            Some(lang_token_for_path(path).to_string())
+        };
         Ok(Self {
             origin: ReaderOrigin::File(path.to_path_buf()),
             raw,
@@ -1391,6 +1512,7 @@ impl Reader {
             doc_search: None,
             edit: None,
             last_meta,
+            wrap_lang,
         })
     }
 
@@ -1434,6 +1556,28 @@ impl Reader {
             doc_search: None,
             edit: None,
             last_meta: None,
+            wrap_lang: None,
+        }
+    }
+
+    /// Text the markdown renderer should parse. For markdown files this is
+    /// the file content verbatim. For other text files we wrap in a fenced
+    /// code block so syntect highlights it through the existing pipeline.
+    pub fn render_source(&self) -> std::borrow::Cow<'_, str> {
+        match &self.wrap_lang {
+            None => std::borrow::Cow::Borrowed(&self.raw),
+            Some(lang) => {
+                let mut s = String::with_capacity(self.raw.len() + lang.len() + 10);
+                s.push_str("```");
+                s.push_str(lang);
+                s.push('\n');
+                s.push_str(&self.raw);
+                if !self.raw.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str("```\n");
+                std::borrow::Cow::Owned(s)
+            }
         }
     }
 }
@@ -2077,13 +2221,63 @@ mod tests {
     }
 
     #[test]
-    fn browser_lists_only_dirs_and_markdown() {
+    fn non_markdown_files_load_with_syntax_highlight_wrapper() {
+        let dir = fresh_temp("non-md-wrap");
+        let json = dir.join("data.jsonl");
+        let body = "{\"a\":1}\n{\"a\":2}\n";
+        std::fs::write(&json, body).unwrap();
+
+        let mut app = App::new(Source::File(json.clone()), opts()).unwrap();
+        // Raw stays exactly what's on disk — saving must not write the
+        // synthetic code fence back to the file.
+        let View::Reader(r) = &app.view else {
+            panic!("expected Reader view");
+        };
+        assert_eq!(r.raw, body);
+        assert_eq!(r.wrap_lang.as_deref(), Some("json"));
+        let rs = r.render_source();
+        assert!(rs.starts_with("```json\n"), "render source: {:?}", rs);
+        assert!(rs.ends_with("```\n"), "render source: {:?}", rs);
+
+        // Render actually produces lines (i.e. pulldown-cmark accepted the
+        // wrapped buffer and syntect highlighted the body).
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!("reader view");
+        };
+        let rendered = r.rendered.as_ref().expect("rendered");
+        assert!(
+            !rendered.lines.is_empty(),
+            "expected rendered lines for json file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn markdown_files_are_not_wrapped() {
+        let dir = fresh_temp("md-no-wrap");
+        let md = dir.join("doc.md");
+        std::fs::write(&md, "# hi\n").unwrap();
+        let app = App::new(Source::File(md.clone()), opts()).unwrap();
+        let View::Reader(r) = &app.view else {
+            panic!("reader");
+        };
+        assert!(r.wrap_lang.is_none());
+        assert_eq!(r.render_source().as_ref(), "# hi\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browser_lists_dirs_and_text_files_filters_binary_and_hidden() {
         let dir = fresh_temp("browser-filter");
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
         std::fs::write(dir.join("a.md"), "# a").unwrap();
         std::fs::write(dir.join("b.markdown"), "# b").unwrap();
-        std::fs::write(dir.join("note.txt"), "ignored").unwrap();
+        std::fs::write(dir.join("note.txt"), "plain text").unwrap();
+        std::fs::write(dir.join("data.json"), "{}").unwrap();
         std::fs::write(dir.join("Cargo.toml"), "ignored").unwrap();
+        std::fs::write(dir.join("blob.bin"), &[0u8, 1, 2][..]).unwrap();
         std::fs::write(dir.join(".hidden.md"), "hidden").unwrap();
 
         let b = Browser::scan(&dir).unwrap();
@@ -2100,8 +2294,13 @@ mod tests {
             "missing b.markdown, got {:?}",
             names
         );
-        assert!(!names.contains(&"note.txt"));
-        assert!(!names.contains(&"Cargo.toml"));
+        // Text-like files are now listed too so the user can open them with
+        // syntax highlighting.
+        assert!(names.contains(&"note.txt"), "missing note.txt, got {:?}", names);
+        assert!(names.contains(&"data.json"), "missing data.json, got {:?}", names);
+        assert!(names.contains(&"Cargo.toml"), "missing Cargo.toml, got {:?}", names);
+        // Truly unknown / binary extensions stay hidden.
+        assert!(!names.contains(&"blob.bin"), "blob.bin should be filtered out, got {:?}", names);
         assert!(names.iter().all(|n| !n.contains(".hidden")));
 
         std::fs::remove_dir_all(&dir).ok();

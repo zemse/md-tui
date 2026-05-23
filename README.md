@@ -28,6 +28,7 @@ The binary is named `md`.
 ```sh
 md                # browse the current directory
 md README.md      # open a file
+md config.json    # any text file — opens with syntax highlighting
 md docs/          # browse a directory
 cat NOTES.md | md # read from stdin
 ```
@@ -47,6 +48,7 @@ cat NOTES.md | md # read from stdin
 - **History** — `h`/`l` (or `b`/`f`) walk back and forward; cursor and scroll position are remembered.
 - **Themes** — Catppuccin Mocha / Latte; auto-selects from `COLORFGBG`, override with `-s dark|light`.
 - **GitHub-flavored** — tables, strikethrough, footnotes, task lists, code-block syntax highlighting (syntect), heading anchors.
+- **Reads any text file** — `.json`, `.jsonl`, `.yaml`, `.toml`, `.rs`, `.py`, `.sh`, plain `.txt`, and more — opened as a single syntax-highlighted code block.
 
 ## Keys
 
