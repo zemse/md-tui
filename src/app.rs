@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use ratatui::layout::Rect;
 
+use crate::jsonl::{self, JsonlOverlay};
 use crate::links::LinkTarget;
 use crate::markdown::{self, Rendered};
 use crate::theme::Theme;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -144,6 +145,14 @@ pub struct Reader {
     /// gives us syntax highlighting for free. `raw` itself stays unwrapped so
     /// editing and saving operate on the actual file content.
     pub wrap_lang: Option<String>,
+    /// JSON-line reader: source line indices the user has expanded into pretty-
+    /// printed form. Empty for non-JSON files.
+    pub jsonl_expanded: HashSet<usize>,
+    /// JSON-line button hit boxes, rebuilt every render. `None` for non-JSON
+    /// files or when no buttons are needed (no line overflows).
+    pub jsonl_overlay: Option<JsonlOverlay>,
+    /// Hover index into `jsonl_overlay.buttons` for cursor feedback.
+    pub hover_jsonl: Option<usize>,
 }
 
 /// Default-active edit-mode UI. `Split` is the new HackMD-style two-pane
@@ -563,6 +572,7 @@ impl App {
         r.rendered = None;
         r.hover_link = None;
         r.hover_checkbox = None;
+        r.hover_jsonl = None;
         r.focus = None;
         if let Some(ds) = &mut r.doc_search {
             ds.matches.clear();
@@ -1183,14 +1193,52 @@ impl App {
                     EditMode::Split => None,
                     EditMode::InPlace => Some(markdown::EditCtx { cursor: e.cursor }),
                 });
-                let source = r.render_source();
-                r.rendered = Some(markdown::render_with_edit(
+                // For JSON-line files we bypass the plain `render_source` and
+                // emit a transformed code block in which expanded source lines
+                // explode into multiple content lines. The returned mapping
+                // lets the post-render pass paint expand/collapse buttons on
+                // the right rows.
+                let (source, jsonl_map) = if r.is_jsonl_view() {
+                    let (s, m) = r.jsonl_render_source();
+                    (std::borrow::Cow::Owned(s), Some(m))
+                } else {
+                    (r.render_source(), None)
+                };
+                let mut rendered = markdown::render_with_edit(
                     source.as_ref(),
                     base_dir.as_deref(),
                     target_w,
                     &theme,
                     edit_ctx,
-                ));
+                );
+                // Inject the gutter buttons + record their hit boxes. The
+                // Pre block sits inside `rendered.blocks` — pick the first
+                // (and only) entry produced by our synthetic fenced wrap.
+                if let Some(map) = jsonl_map {
+                    let pre_start = rendered
+                        .blocks
+                        .first()
+                        .map(|b| b.display_start)
+                        .unwrap_or(0);
+                    let raw_lines: Vec<&str> = r.raw.split('\n').collect();
+                    let overlay = crate::jsonl::inject_buttons(
+                        &mut rendered.lines,
+                        &raw_lines,
+                        &map,
+                        &r.jsonl_expanded,
+                        pre_start,
+                        target_w as usize,
+                        theme.heading[0],
+                    );
+                    r.jsonl_overlay = if overlay.buttons.is_empty() {
+                        None
+                    } else {
+                        Some(overlay)
+                    };
+                } else {
+                    r.jsonl_overlay = None;
+                }
+                r.rendered = Some(rendered);
                 if let Some(rd) = &r.rendered {
                     let max_scroll = rd.lines.len().saturating_sub(1) as u16;
                     if r.preview_scroll > max_scroll {
@@ -1513,6 +1561,9 @@ impl Reader {
             edit: None,
             last_meta,
             wrap_lang,
+            jsonl_expanded: HashSet::new(),
+            jsonl_overlay: None,
+            hover_jsonl: None,
         })
     }
 
@@ -1557,7 +1608,68 @@ impl Reader {
             edit: None,
             last_meta: None,
             wrap_lang: None,
+            jsonl_expanded: HashSet::new(),
+            jsonl_overlay: None,
+            hover_jsonl: None,
         }
+    }
+
+    /// True for `.json` / `.jsonl` / `.ndjson` files. Drives per-line expand
+    /// affordance.
+    pub fn is_jsonl_view(&self) -> bool {
+        self.wrap_lang.as_deref() == Some("json")
+    }
+
+    /// For a JSON-line file, build the transformed source the markdown
+    /// renderer should consume. Returns `(source, code_line_to_source_line)`
+    /// where each entry in the vec maps a content line index (within the
+    /// emitted fenced block, top-to-bottom) back to its origin line index in
+    /// `self.raw`. Expanded source lines explode into multiple content lines
+    /// — all sharing the same origin index, so a click on any of their
+    /// rendered rows targets the same source line.
+    fn jsonl_render_source(&self) -> (String, Vec<usize>) {
+        let lang = self.wrap_lang.as_deref().unwrap_or("");
+        let mut out = String::with_capacity(self.raw.len() + lang.len() + 16);
+        let mut map: Vec<usize> = Vec::new();
+        out.push_str("```");
+        out.push_str(lang);
+        out.push('\n');
+        for (idx, line) in self.raw.split('\n').enumerate() {
+            // `split('\n')` keeps a trailing empty element when raw ends in
+            // `\n` — emit that empty line too so positions stay aligned.
+            if self.jsonl_expanded.contains(&idx) {
+                if let Some(pretty) = jsonl::prettify(line) {
+                    for pl in &pretty {
+                        out.push_str(pl);
+                        out.push('\n');
+                        map.push(idx);
+                    }
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+            map.push(idx);
+        }
+        out.push_str("```\n");
+        (out, map)
+    }
+
+    /// Toggle the expanded state of source `line`. If collapsing, the entry
+    /// is removed; if expanding, the line is parsed first and the toggle is
+    /// rejected (returning `Err`) when the line isn't valid JSON.
+    pub fn toggle_jsonl_line(&mut self, line: usize) -> std::result::Result<bool, &'static str> {
+        if self.jsonl_expanded.remove(&line) {
+            self.rendered = None;
+            return Ok(false);
+        }
+        let raw_line = self.raw.split('\n').nth(line).unwrap_or("");
+        if jsonl::prettify(raw_line).is_none() {
+            return Err("Line is not valid JSON");
+        }
+        self.jsonl_expanded.insert(line);
+        self.rendered = None;
+        Ok(true)
     }
 
     /// Text the markdown renderer should parse. For markdown files this is
@@ -2255,6 +2367,80 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_long_lines_get_expand_button() {
+        let dir = fresh_temp("jsonl-button");
+        let json = dir.join("data.jsonl");
+        // Two lines: one short (fits in 80 cols), one long enough to overflow.
+        let short = r#"{"a":1}"#;
+        let long = format!("{{\"big\":\"{}\"}}", "x".repeat(120));
+        std::fs::write(&json, format!("{}\n{}\n", short, long)).unwrap();
+
+        let mut app = App::new(Source::File(json.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!("reader");
+        };
+        let overlay = r.jsonl_overlay.as_ref().expect("overlay present");
+        assert_eq!(overlay.buttons.len(), 1);
+        assert_eq!(overlay.buttons[0].source_line, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_toggle_expand_grows_rendered_rows() {
+        let dir = fresh_temp("jsonl-toggle");
+        let json = dir.join("data.jsonl");
+        let long = format!(r#"{{"big":"{}"}}"#, "x".repeat(120));
+        std::fs::write(&json, format!("{}\n", long)).unwrap();
+
+        let mut app = App::new(Source::File(json.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        let initial_rows = {
+            let View::Reader(r) = &app.view else {
+                panic!()
+            };
+            r.rendered.as_ref().unwrap().lines.len()
+        };
+
+        // Expand line 0.
+        if let View::Reader(r) = &mut app.view {
+            r.toggle_jsonl_line(0).expect("valid JSON");
+        }
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!()
+        };
+        let expanded_rows = r.rendered.as_ref().unwrap().lines.len();
+        assert!(
+            expanded_rows > initial_rows,
+            "expanded ({}) should exceed initial ({})",
+            expanded_rows,
+            initial_rows
+        );
+        // Every row that backs the source line should have a clickable button
+        // (head row + continuation guides).
+        let overlay = r.jsonl_overlay.as_ref().expect("overlay");
+        assert!(overlay.buttons.len() >= 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_toggle_rejects_invalid_json() {
+        let dir = fresh_temp("jsonl-invalid");
+        let json = dir.join("data.jsonl");
+        // Long enough to get a button but not valid JSON.
+        std::fs::write(&json, format!("{}\n", "x".repeat(120))).unwrap();
+        let mut app = App::new(Source::File(json.clone()), opts()).unwrap();
+        if let View::Reader(r) = &mut app.view {
+            assert!(r.toggle_jsonl_line(0).is_err());
+            assert!(r.jsonl_expanded.is_empty());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn markdown_files_are_not_wrapped() {
         let dir = fresh_temp("md-no-wrap");
         let md = dir.join("doc.md");
@@ -2296,11 +2482,27 @@ mod tests {
         );
         // Text-like files are now listed too so the user can open them with
         // syntax highlighting.
-        assert!(names.contains(&"note.txt"), "missing note.txt, got {:?}", names);
-        assert!(names.contains(&"data.json"), "missing data.json, got {:?}", names);
-        assert!(names.contains(&"Cargo.toml"), "missing Cargo.toml, got {:?}", names);
+        assert!(
+            names.contains(&"note.txt"),
+            "missing note.txt, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"data.json"),
+            "missing data.json, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Cargo.toml"),
+            "missing Cargo.toml, got {:?}",
+            names
+        );
         // Truly unknown / binary extensions stay hidden.
-        assert!(!names.contains(&"blob.bin"), "blob.bin should be filtered out, got {:?}", names);
+        assert!(
+            !names.contains(&"blob.bin"),
+            "blob.bin should be filtered out, got {:?}",
+            names
+        );
         assert!(names.iter().all(|n| !n.contains(".hidden")));
 
         std::fs::remove_dir_all(&dir).ok();

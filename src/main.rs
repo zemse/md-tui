@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod events;
+mod jsonl;
 mod links;
 mod markdown;
 mod palette;

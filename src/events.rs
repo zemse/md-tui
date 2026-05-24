@@ -1515,6 +1515,7 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
         if col < inner_x {
             r.hover_link = None;
             r.hover_checkbox = None;
+            r.hover_jsonl = None;
             return;
         }
         let local_col = (col - inner_x) as usize;
@@ -1522,6 +1523,10 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
         let line_idx = r.scroll as usize + local_row;
         r.hover_link = rendered.link_map.at(line_idx, local_col);
         r.hover_checkbox = rendered.checkbox_map.at(line_idx, local_col);
+        r.hover_jsonl = r
+            .jsonl_overlay
+            .as_ref()
+            .and_then(|o| o.at(line_idx, local_col));
     }
 }
 
@@ -1554,6 +1559,22 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                         e.discard_pending = false;
                     }
                     r.rendered = None;
+                }
+                return Ok(());
+            }
+            // JSON-line expand button beats every other hit-test on its row:
+            // it sits in the left gutter so it never overlaps real content.
+            if let Some(bi) = r
+                .jsonl_overlay
+                .as_ref()
+                .and_then(|o| o.at(line_idx, local_col))
+            {
+                let src = r.jsonl_overlay.as_ref().unwrap().buttons[bi].source_line;
+                match r.toggle_jsonl_line(src) {
+                    Ok(_) => {
+                        r.hover_jsonl = None;
+                    }
+                    Err(msg) => app.status = msg.to_string(),
                 }
                 return Ok(());
             }

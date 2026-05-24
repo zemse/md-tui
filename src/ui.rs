@@ -223,6 +223,13 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+        if let Some(bi) = r.hover_jsonl {
+            if let Some(btn) = r.jsonl_overlay.as_ref().and_then(|o| o.buttons.get(bi)) {
+                if btn.line == idx {
+                    highlight_checkbox_hover(&mut line, btn.col_start, btn.col_end);
+                }
+            }
+        }
         if let Some(s) = r.doc_search.as_ref() {
             for (mi, m) in s.matches.iter().enumerate() {
                 if m.line == idx {
