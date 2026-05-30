@@ -610,6 +610,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 return Ok(());
             }
         }
+        // Click the URL shown in the statusline middle → copy it to clipboard.
+        if let Some((sx, ex, url)) = app.statusline_url_hit.clone() {
+            if m.column >= sx && m.column < ex {
+                copy_to_clipboard(&url);
+                app.status = format!("Copied: {}", url);
+                return Ok(());
+            }
+        }
     }
     // While the search overlay is up, the mouse wheel scrolls results.
     if app.search.is_some() {

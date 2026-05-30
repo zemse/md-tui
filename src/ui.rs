@@ -913,6 +913,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     // knows they're in a mutating mode.
     let mut back_span: Option<Span> = None;
     app.back_button_hit = None;
+    app.statusline_url_hit = None;
     let edit_badge: Option<Span> = if let View::Reader(r) = &app.view {
         r.edit.as_ref().map(|e| {
             let label = if e.dirty { " EDIT* " } else { " EDIT " };
@@ -963,6 +964,22 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut line_spans: Vec<Span<'static>> = Vec::new();
     let mid_text = middle.text();
+    // When the middle is a URL, record the screen column range it occupies so
+    // a click on it can copy the (untruncated) target. `record_url_hit` reads
+    // the accumulated span width to learn where the next span will start.
+    let is_url = matches!(middle, Mid::Url { .. });
+    // Returns the hit region for the URL span about to be pushed: it starts at
+    // `area.x + <accumulated width>` and spans `width` columns. Returns None
+    // when the middle isn't a URL.
+    let url_hit = |spans: &[Span<'static>], width: usize| -> Option<(u16, u16, String)> {
+        if is_url {
+            let start_x = area.x + span_width(spans) as u16;
+            Some((start_x, start_x + width as u16, mid_text.clone()))
+        } else {
+            None
+        }
+    };
+    let mut url_hit_region: Option<(u16, u16, String)> = None;
     match edge_swap {
         EdgeSwap::Right => {
             // URL pinned to the right of the row (just before scroll%).
@@ -971,6 +988,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             let mid_w = UnicodeWidthStr::width(mid_styled.content.as_ref());
             let used = span_width(&line_spans) + mid_w + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            url_hit_region = url_hit(&line_spans, mid_w);
             line_spans.push(mid_styled);
             line_spans.push(right);
         }
@@ -980,7 +998,10 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
                 line_spans.push(b);
                 line_spans.push(Span::raw(" "));
             }
-            line_spans.push(Span::styled(format!(" {} ", mid_text), middle.style(theme)));
+            let mid_styled = Span::styled(format!(" {} ", mid_text), middle.style(theme));
+            let mid_w = UnicodeWidthStr::width(mid_styled.content.as_ref());
+            url_hit_region = url_hit(&line_spans, mid_w);
+            line_spans.push(mid_styled);
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
             line_spans.push(right);
@@ -995,7 +1016,9 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
                     .saturating_sub(used_left)
                     .saturating_sub(right_w + 2);
                 let truncated = truncate_mid(&mid_text, max_mid);
+                let mid_w = UnicodeWidthStr::width(truncated.as_str());
                 line_spans.push(Span::raw(" ".repeat(pad_left)));
+                url_hit_region = url_hit(&line_spans, mid_w);
                 line_spans.push(Span::styled(truncated, middle.style(theme)));
             }
             let used = span_width(&line_spans) + right_w;
@@ -1003,6 +1026,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             line_spans.push(right);
         }
     }
+    app.statusline_url_hit = url_hit_region;
 
     let _ = muted;
     f.render_widget(Paragraph::new(Line::from(line_spans)), area);

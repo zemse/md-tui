@@ -44,6 +44,10 @@ pub struct App {
     /// Last column range occupied by the `[‹ Back]` button in the statusline,
     /// recorded by the renderer so click handling can hit-test it.
     pub back_button_hit: Option<(u16, u16)>,
+    /// Column range and full target of the URL shown in the statusline middle,
+    /// recorded by the renderer so a click on it can copy the (untruncated)
+    /// URL to the clipboard.
+    pub statusline_url_hit: Option<(u16, u16, String)>,
     /// Pending vim count prefix (e.g. user typed `5` waiting for `j`). Reset
     /// after the motion key consumes it, or on Esc.
     pub count_prefix: Option<u32>,
@@ -366,6 +370,7 @@ impl App {
             viewport: Rect::new(0, 0, 0, 0),
             statusline_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
+            statusline_url_hit: None,
             count_prefix: None,
             pending_g: None,
             pending_z: None,
