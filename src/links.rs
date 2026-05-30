@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,109 @@ pub struct ImageRef {
 #[derive(Default, Clone, Debug)]
 pub struct CheckboxMap {
     pub items: Vec<CheckboxSpan>,
+}
+
+// ---------------------------------------------------------------------------
+// Tables: click-to-expand state + hit-test geometry
+// ---------------------------------------------------------------------------
+
+/// Which parts of one table are expanded (show full, untruncated content).
+/// Keyed in `TableExpansions` by the table's source byte offset so it survives
+/// re-renders. `all` overrides the granular sets.
+#[derive(Default, Clone, Debug)]
+pub struct TableExpand {
+    /// Whole table expanded (clicking any border toggles this).
+    pub all: bool,
+    /// Columns expanded by clicking their header cell.
+    pub cols: HashSet<usize>,
+    /// Individual `(body_row, col)` cells expanded by clicking them.
+    pub cells: HashSet<(usize, usize)>,
+}
+
+impl TableExpand {
+    /// True once nothing is expanded — lets callers drop the entry entirely.
+    pub fn is_empty(&self) -> bool {
+        !self.all && self.cols.is_empty() && self.cells.is_empty()
+    }
+}
+
+/// Per-table expansion state, keyed by table source byte offset.
+pub type TableExpansions = HashMap<u64, TableExpand>;
+
+/// What a click inside a table region resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableHit {
+    /// A border cell (any `│`/`─` glyph) — toggles the whole table.
+    All,
+    /// A header cell at this column index — toggles that column.
+    Column(usize),
+    /// A body cell at `(body_row, col)` — toggles just that cell.
+    Cell(usize, usize),
+}
+
+/// Hit-test geometry for one rendered table. Produced by the layout pass and
+/// consumed by click handling to decide whether a click expands the whole
+/// table, a column, or a single cell.
+#[derive(Clone, Debug)]
+pub struct TableRegion {
+    /// Stable id = source byte offset of the table block.
+    pub id: u64,
+    /// Display-line range of the whole table including borders (half-open).
+    pub line_start: usize,
+    pub line_end: usize,
+    /// Display lines that are full-width horizontal borders.
+    pub border_lines: Vec<usize>,
+    /// Display-line range spanned by the header row group (half-open).
+    pub header_start: usize,
+    pub header_end: usize,
+    /// `[start, end)` content+padding x-range of each column (between borders).
+    pub col_x: Vec<(usize, usize)>,
+    /// x positions occupied by the vertical `│` borders.
+    pub border_x: Vec<usize>,
+    /// `(line_start, line_end)` per body row, parallel to body row index.
+    pub body_rows: Vec<(usize, usize)>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct TableMap {
+    pub regions: Vec<TableRegion>,
+}
+
+impl TableMap {
+    /// Resolve a click at display `(line, col)` to the table it lands in and
+    /// the granularity it targets. A click on any border glyph expands the
+    /// whole table; a click in a header cell expands that column; a click in a
+    /// body cell expands that cell.
+    pub fn hit(&self, line: usize, col: usize) -> Option<(u64, TableHit)> {
+        for reg in &self.regions {
+            if line < reg.line_start || line >= reg.line_end {
+                continue;
+            }
+            // Any border glyph (horizontal border row or vertical bar column)
+            // → whole-table toggle.
+            if reg.border_lines.contains(&line) || reg.border_x.contains(&col) {
+                return Some((reg.id, TableHit::All));
+            }
+            let column = reg.col_x.iter().position(|&(s, e)| col >= s && col < e);
+            let Some(ci) = column else {
+                // Inside the table outline but not in any column cell — treat
+                // as a border-style whole-table toggle.
+                return Some((reg.id, TableHit::All));
+            };
+            if line >= reg.header_start && line < reg.header_end {
+                return Some((reg.id, TableHit::Column(ci)));
+            }
+            if let Some(ri) = reg
+                .body_rows
+                .iter()
+                .position(|&(s, e)| line >= s && line < e)
+            {
+                return Some((reg.id, TableHit::Cell(ri, ci)));
+            }
+            return Some((reg.id, TableHit::All));
+        }
+        None
+    }
 }
 
 impl CheckboxMap {

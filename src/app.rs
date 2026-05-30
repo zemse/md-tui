@@ -153,6 +153,11 @@ pub struct Reader {
     pub jsonl_overlay: Option<JsonlOverlay>,
     /// Hover index into `jsonl_overlay.buttons` for cursor feedback.
     pub hover_jsonl: Option<usize>,
+    /// Per-table click-to-expand state, keyed by the table's source byte
+    /// offset. Clicking a table border expands the whole table; a header cell
+    /// expands that column; a body cell expands just that cell. Threaded into
+    /// the renderer so expanded parts show full, untruncated content.
+    pub tables: crate::links::TableExpansions,
 }
 
 /// Default-active edit-mode UI. `Split` is the new HackMD-style two-pane
@@ -1210,6 +1215,7 @@ impl App {
                     target_w,
                     &theme,
                     edit_ctx,
+                    &r.tables,
                 );
                 // Inject the gutter buttons + record their hit boxes. The
                 // Pre block sits inside `rendered.blocks` — pick the first
@@ -1564,6 +1570,7 @@ impl Reader {
             jsonl_expanded: HashSet::new(),
             jsonl_overlay: None,
             hover_jsonl: None,
+            tables: crate::links::TableExpansions::new(),
         })
     }
 
@@ -1594,6 +1601,31 @@ impl Reader {
         }
     }
 
+    /// Toggle the click-to-expand state of part of the table identified by
+    /// source byte offset `id`. Forces a re-render so the new state takes
+    /// effect; drops the entry entirely once nothing in the table is expanded.
+    pub fn toggle_table(&mut self, id: u64, hit: crate::links::TableHit) {
+        use crate::links::TableHit;
+        let st = self.tables.entry(id).or_default();
+        match hit {
+            TableHit::All => st.all = !st.all,
+            TableHit::Column(c) => {
+                if !st.cols.remove(&c) {
+                    st.cols.insert(c);
+                }
+            }
+            TableHit::Cell(r, c) => {
+                if !st.cells.remove(&(r, c)) {
+                    st.cells.insert((r, c));
+                }
+            }
+        }
+        if st.is_empty() {
+            self.tables.remove(&id);
+        }
+        self.rendered = None;
+    }
+
     pub fn from_string(raw: String) -> Self {
         Self {
             origin: ReaderOrigin::Stdin,
@@ -1611,6 +1643,7 @@ impl Reader {
             jsonl_expanded: HashSet::new(),
             jsonl_overlay: None,
             hover_jsonl: None,
+            tables: crate::links::TableExpansions::new(),
         }
     }
 
@@ -2397,9 +2430,7 @@ mod tests {
         let mut app = App::new(Source::File(json.clone()), opts()).unwrap();
         app.ensure_rendered(80);
         let initial_rows = {
-            let View::Reader(r) = &app.view else {
-                panic!()
-            };
+            let View::Reader(r) = &app.view else { panic!() };
             r.rendered.as_ref().unwrap().lines.len()
         };
 
@@ -2408,9 +2439,7 @@ mod tests {
             r.toggle_jsonl_line(0).expect("valid JSON");
         }
         app.ensure_rendered(80);
-        let View::Reader(r) = &app.view else {
-            panic!()
-        };
+        let View::Reader(r) = &app.view else { panic!() };
         let expanded_rows = r.rendered.as_ref().unwrap().lines.len();
         assert!(
             expanded_rows > initial_rows,

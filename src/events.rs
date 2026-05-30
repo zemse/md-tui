@@ -1583,10 +1583,19 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 app.toggle_checkbox(ci)?;
                 return Ok(());
             }
+            // A link inside a table cell still follows the link; only clicks
+            // that miss every link toggle table expansion (handled below).
             if let Some(li) = rendered.link_map.at(line_idx, local_col) {
                 let target = rendered.link_map.links[li].target.clone();
                 r.focus = Some(Focus::Link(li));
                 app.follow(target)?;
+                return Ok(());
+            }
+            // Table click-to-expand: border → whole table, header cell →
+            // column, body cell → that cell.
+            if let Some((id, hit)) = rendered.table_map.hit(line_idx, local_col) {
+                r.toggle_table(id, hit);
+                return Ok(());
             }
             None
         }

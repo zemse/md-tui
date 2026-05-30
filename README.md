@@ -37,6 +37,7 @@ cat NOTES.md | md # read from stdin
 
 - **Mouse-aware** — wheel to scroll, click links to follow, hover for highlight, click `‹ Back` in the header.
 - **Clickable task lists** — click `- [ ]` / `- [x]` to toggle; the file is rewritten in place.
+- **Expandable tables** — overflowing cells are truncated by default; click a cell to wrap just it, a column header to widen that column, or any border to expand the whole table. Click again to collapse.
 - **Native text selection** — press `m` to drop mouse capture and drag-select with the terminal.
 - **In-document search** — `/` in Reader, then `n`/`N` to step matches; `T` for fuzzy file search.
 - **Directory browser** — full-screen one-level listing; `Enter`/`→` opens or descends, `Esc`/`←` walks back; gitignore-aware.

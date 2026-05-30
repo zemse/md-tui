@@ -11,7 +11,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::links::{self, CheckboxMap, CheckboxSpan, ImageRef, LinkMap, LinkSpan, LinkTarget};
+use crate::links::{
+    self, CheckboxMap, CheckboxSpan, ImageRef, LinkMap, LinkSpan, LinkTarget, TableExpand,
+    TableExpansions, TableMap, TableRegion,
+};
 use crate::syntax;
 use crate::theme::Theme;
 
@@ -20,6 +23,8 @@ pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub link_map: LinkMap,
     pub checkbox_map: CheckboxMap,
+    /// Click-to-expand hit-test geometry for every table in the document.
+    pub table_map: TableMap,
     pub images: Vec<ImageRef>,
     pub width: u16,
     /// One entry per block in document order. Lets edit mode locate the
@@ -57,7 +62,14 @@ pub struct EditCtx {
 /// `render_with_edit`; pass `None` for the edit context when not editing.
 #[cfg(test)]
 pub fn render(source: &str, base_dir: Option<&Path>, width: u16, theme: &Theme) -> Rendered {
-    render_with_edit(source, base_dir, width, theme, None)
+    render_with_edit(
+        source,
+        base_dir,
+        width,
+        theme,
+        None,
+        &TableExpansions::new(),
+    )
 }
 
 pub fn render_with_edit(
@@ -66,6 +78,7 @@ pub fn render_with_edit(
     width: u16,
     theme: &Theme,
     edit: Option<EditCtx>,
+    tables: &TableExpansions,
 ) -> Rendered {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -82,6 +95,7 @@ pub fn render_with_edit(
         base_dir.map(|p| p.to_path_buf()),
         source.to_string(),
         edit,
+        tables.clone(),
     );
     for (ev, range) in parser {
         b.event(ev, range);
@@ -196,6 +210,9 @@ struct Builder {
 
     // table state
     table: Option<TableState>,
+    /// Per-table click-to-expand state, keyed by source byte offset. Threaded
+    /// into the layout pass so expanded cells/columns/tables render full.
+    tables: TableExpansions,
 }
 
 struct TableState {
@@ -228,6 +245,7 @@ impl Builder {
         base_dir: Option<PathBuf>,
         source: String,
         edit: Option<EditCtx>,
+        tables: TableExpansions,
     ) -> Self {
         let width = if width == 0 { 80 } else { width };
         Self {
@@ -254,6 +272,7 @@ impl Builder {
             open_link: None,
             inline_range_stack: Vec::new(),
             table: None,
+            tables,
         }
     }
 
@@ -782,6 +801,7 @@ impl Builder {
             self.checkboxes,
             self.images,
             self.edit,
+            &self.tables,
         )
     }
 }
@@ -1007,11 +1027,13 @@ fn layout(
     checkboxes: Vec<PendingCheckbox>,
     images: Vec<PathBuf>,
     edit: Option<EditCtx>,
+    tables: &TableExpansions,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut row_source: Vec<Option<std::ops::Range<usize>>> = Vec::new();
     let mut out_links: Vec<LinkSpan> = Vec::new();
     let mut out_checkboxes: Vec<CheckboxSpan> = Vec::new();
+    let mut out_tables: Vec<TableRegion> = Vec::new();
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
     let mut block_infos: Vec<BlockInfo> = Vec::new();
@@ -1086,6 +1108,7 @@ fn layout(
                 header,
                 rows,
             } => {
+                let id = block_source_range.start as u64;
                 layout_table(
                     theme,
                     &alignments,
@@ -1095,6 +1118,9 @@ fn layout(
                     &mut out_lines,
                     &mut out_links,
                     &links,
+                    id,
+                    tables.get(&id),
+                    &mut out_tables,
                 );
             }
             Block::Pre {
@@ -1196,6 +1222,9 @@ fn layout(
         lines: out_lines,
         link_map,
         checkbox_map,
+        table_map: TableMap {
+            regions: out_tables,
+        },
         images: images_out,
         width: width as u16,
         blocks: block_infos,
@@ -1719,6 +1748,7 @@ impl StyleExt for Style {
 // Table layout: column-aligned with box-drawing borders.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn layout_table(
     theme: &Theme,
     alignments: &[Alignment],
@@ -1728,6 +1758,9 @@ fn layout_table(
     out_lines: &mut Vec<Line<'static>>,
     out_links: &mut Vec<LinkSpan>,
     links: &[PendingLink],
+    table_id: u64,
+    expand: Option<&TableExpand>,
+    out_tables: &mut Vec<TableRegion>,
 ) {
     let n_cols = header
         .len()
@@ -1738,64 +1771,144 @@ fn layout_table(
 
     let cell_w = |runs: &[Run]| -> usize { runs.iter().map(|r| r.text.width()).sum() };
 
-    let mut col_widths = vec![0usize; n_cols];
+    // Natural (untruncated) width of every column.
+    let mut natural = vec![0usize; n_cols];
     for (i, c) in header.iter().enumerate() {
         if i < n_cols {
-            col_widths[i] = col_widths[i].max(cell_w(c));
+            natural[i] = natural[i].max(cell_w(c));
         }
     }
     for row in rows {
         for (i, c) in row.iter().enumerate() {
             if i < n_cols {
-                col_widths[i] = col_widths[i].max(cell_w(c));
+                natural[i] = natural[i].max(cell_w(c));
             }
         }
     }
 
-    // Constrain to terminal width: total = 1 + sum(w + 3).
+    let all = expand.map(|e| e.all).unwrap_or(false);
+    let col_expanded = |c: usize| all || expand.map(|e| e.cols.contains(&c)).unwrap_or(false);
+    let cell_expanded = |r: usize, c: usize| {
+        all || col_expanded(c) || expand.map(|e| e.cells.contains(&(r, c))).unwrap_or(false)
+    };
+
+    // Constrain to terminal width: total frame = 1 + sum(w + 3). Expanded
+    // columns keep their natural width; the rest absorb the shrink first so a
+    // freshly-expanded date column reclaims room from prose columns.
     let frame_overhead = 1 + 3 * n_cols;
     let avail = max_width.saturating_sub(frame_overhead).max(n_cols);
+    let mut col_widths = natural.clone();
     let total: usize = col_widths.iter().sum();
     if total > avail {
-        // Shrink widest columns proportionally to fit.
-        let scale = avail as f64 / total as f64;
-        for w in col_widths.iter_mut() {
-            *w = ((*w as f64) * scale).floor() as usize;
-            if *w == 0 {
-                *w = 1;
-            }
+        let over = total - avail;
+        let unprotected: Vec<usize> = (0..n_cols).filter(|&c| !col_expanded(c)).collect();
+        let removed = shrink_columns(&mut col_widths, &unprotected, over);
+        if removed < over {
+            let protected: Vec<usize> = (0..n_cols).filter(|&c| col_expanded(c)).collect();
+            shrink_columns(&mut col_widths, &protected, over - removed);
+        }
+    }
+    for w in col_widths.iter_mut() {
+        if *w == 0 {
+            *w = 1;
         }
     }
 
     let border = Style::default().fg(theme.muted);
 
+    // Border x-positions: a │ sits at x=0 and after each column's
+    // (pad + content + pad). Column click area is the span between borders.
+    let mut border_x: Vec<usize> = Vec::with_capacity(n_cols + 1);
+    let mut x = 0usize;
+    border_x.push(x);
+    for w in &col_widths {
+        x += w + 3;
+        border_x.push(x);
+    }
+    let col_x: Vec<(usize, usize)> = (0..n_cols)
+        .map(|c| (border_x[c] + 1, border_x[c + 1]))
+        .collect();
+
+    let line_start = out_lines.len();
+    let mut border_lines: Vec<usize> = Vec::new();
+
+    border_lines.push(out_lines.len());
     out_lines.push(border_line(&col_widths, '┌', '┬', '┐', border));
+
+    let header_start = out_lines.len();
     emit_row(
         theme,
         header,
         &col_widths,
         alignments,
         true,
+        &|c| col_expanded(c),
         out_lines,
         out_links,
         links,
         border,
     );
+    let header_end = out_lines.len();
+
+    border_lines.push(out_lines.len());
     out_lines.push(border_line(&col_widths, '├', '┼', '┤', border));
-    for row in rows {
+
+    let mut body_rows: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+    for (ri, row) in rows.iter().enumerate() {
+        let row_start = out_lines.len();
         emit_row(
             theme,
             row,
             &col_widths,
             alignments,
             false,
+            &|c| cell_expanded(ri, c),
             out_lines,
             out_links,
             links,
             border,
         );
+        body_rows.push((row_start, out_lines.len()));
     }
+
+    border_lines.push(out_lines.len());
     out_lines.push(border_line(&col_widths, '└', '┴', '┘', border));
+
+    out_tables.push(TableRegion {
+        id: table_id,
+        line_start,
+        line_end: out_lines.len(),
+        border_lines,
+        header_start,
+        header_end,
+        col_x,
+        border_x,
+        body_rows,
+    });
+}
+
+/// Reduce the combined width of `cols` by up to `amount`, taking a column from
+/// the widest eligible column each step and never dropping below 1. Returns the
+/// amount actually removed (less than `amount` only when every listed column is
+/// already at width 1).
+fn shrink_columns(widths: &mut [usize], cols: &[usize], amount: usize) -> usize {
+    let mut removed = 0usize;
+    while removed < amount {
+        let mut best: Option<usize> = None;
+        for &c in cols {
+            if widths[c] > 1 && best.map(|b| widths[c] > widths[b]).unwrap_or(true) {
+                best = Some(c);
+            }
+        }
+        match best {
+            Some(b) => {
+                widths[b] -= 1;
+                removed += 1;
+            }
+            None => break,
+        }
+    }
+    removed
 }
 
 fn border_line(
@@ -1816,64 +1929,163 @@ fn border_line(
     Line::from(Span::styled(s, style))
 }
 
+/// Emit one logical table row, which may span several physical lines: an
+/// expanded cell word-wraps to its column width while its siblings stay on the
+/// first line. `expanded(col)` decides per-column whether to wrap (full
+/// content) or truncate to a single line.
+#[allow(clippy::too_many_arguments)]
 fn emit_row(
     theme: &Theme,
     row: &[Vec<Run>],
     col_widths: &[usize],
     alignments: &[Alignment],
     is_header: bool,
+    expanded: &dyn Fn(usize) -> bool,
     out_lines: &mut Vec<Line<'static>>,
     out_links: &mut Vec<LinkSpan>,
     links: &[PendingLink],
     border: Style,
 ) {
-    let line = out_lines.len();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut col = 0usize;
-
-    spans.push(Span::styled("│".to_string(), border));
-    col += 1;
-
     let empty: Vec<Run> = Vec::new();
 
+    // Per-column physical lines: truncated cells are a single line; expanded
+    // cells wrap to many. Row height is the tallest column.
+    let mut cell_lines: Vec<Vec<Vec<Run>>> = Vec::with_capacity(col_widths.len());
+    let mut height = 1usize;
     for (i, w) in col_widths.iter().enumerate() {
         let cell = row.get(i).unwrap_or(&empty);
-        let align = alignments.get(i).copied().unwrap_or(Alignment::None);
-        let truncated = truncate_runs(cell, *w);
-        let cw: usize = truncated.iter().map(|r| r.text.width()).sum();
-        let extra = w.saturating_sub(cw);
-        let (lpad, rpad) = match align {
-            Alignment::Right => (extra, 0),
-            Alignment::Center => (extra / 2, extra - extra / 2),
-            _ => (0, extra),
+        let lines = if expanded(i) {
+            wrap_runs_to_lines(cell, *w)
+        } else {
+            vec![truncate_runs(cell, *w)]
         };
+        height = height.max(lines.len());
+        cell_lines.push(lines);
+    }
 
-        // leading inner pad
-        spans.push(Span::raw(" ".to_string()));
-        col += 1;
-        if lpad > 0 {
-            spans.push(Span::raw(" ".repeat(lpad)));
-            col += lpad;
-        }
-
-        // cell content
-        emit_runs_tracking_links(
-            &truncated, is_header, theme, &mut spans, &mut col, line, out_links, links,
-        );
-
-        if rpad > 0 {
-            spans.push(Span::raw(" ".repeat(rpad)));
-            col += rpad;
-        }
-        // trailing inner pad
-        spans.push(Span::raw(" ".to_string()));
-        col += 1;
+    for k in 0..height {
+        let line = out_lines.len();
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
 
         spans.push(Span::styled("│".to_string(), border));
         col += 1;
+
+        for (i, w) in col_widths.iter().enumerate() {
+            let align = alignments.get(i).copied().unwrap_or(Alignment::None);
+            let content: &[Run] = cell_lines[i].get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+            let cw: usize = content.iter().map(|r| r.text.width()).sum();
+            let extra = w.saturating_sub(cw);
+            let (lpad, rpad) = match align {
+                Alignment::Right => (extra, 0),
+                Alignment::Center => (extra / 2, extra - extra / 2),
+                _ => (0, extra),
+            };
+
+            // leading inner pad
+            spans.push(Span::raw(" ".to_string()));
+            col += 1;
+            if lpad > 0 {
+                spans.push(Span::raw(" ".repeat(lpad)));
+                col += lpad;
+            }
+
+            // cell content
+            emit_runs_tracking_links(
+                content, is_header, theme, &mut spans, &mut col, line, out_links, links,
+            );
+
+            if rpad > 0 {
+                spans.push(Span::raw(" ".repeat(rpad)));
+                col += rpad;
+            }
+            // trailing inner pad
+            spans.push(Span::raw(" ".to_string()));
+            col += 1;
+
+            spans.push(Span::styled("│".to_string(), border));
+            col += 1;
+        }
+
+        out_lines.push(Line::from(spans));
+    }
+}
+
+/// Word-wrap a cell's runs to `width` display columns, one `Vec<Run>` per
+/// physical line, preserving each run's style and link. Trailing whitespace is
+/// trimmed so it doesn't disturb column alignment. Always returns at least one
+/// (possibly empty) line.
+fn wrap_runs_to_lines(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
+    // Concatenate into a single string plus a parallel run-boundary table so
+    // wrap byte ranges can be sliced back into styled sub-runs.
+    let mut s = String::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(runs.len() + 1);
+    for r in runs {
+        offsets.push(s.len());
+        s.push_str(&r.text);
+    }
+    offsets.push(s.len());
+
+    if s.is_empty() {
+        return vec![Vec::new()];
     }
 
-    out_lines.push(Line::from(spans));
+    let mut out: Vec<Vec<Run>> = Vec::new();
+    for (range, _text) in wrap_to_width(&s, width.max(1)) {
+        let mut line = slice_runs(runs, &offsets, range.start, range.end);
+        trim_trailing_ws(&mut line);
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    out
+}
+
+/// Slice the styled `runs` to the byte window `[start, end)` of their
+/// concatenation (`offsets[i]` is run `i`'s start byte). Drops checkbox/image/
+/// cursor metadata — wrapped table cells carry only text, style, and links.
+fn slice_runs(runs: &[Run], offsets: &[usize], start: usize, end: usize) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for (i, r) in runs.iter().enumerate() {
+        let rs = offsets[i];
+        let re = offsets[i + 1];
+        let a = start.max(rs);
+        let b = end.min(re);
+        if a >= b {
+            continue;
+        }
+        let text = r.text.get(a - rs..b - rs).unwrap_or("").to_string();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(Run {
+            text,
+            style: r.style,
+            link: r.link,
+            checkbox: None,
+            image: None,
+            inline_range: None,
+            cursor_at: None,
+        });
+    }
+    out
+}
+
+/// Trim trailing whitespace from the last run(s) of a wrapped line.
+fn trim_trailing_ws(line: &mut Vec<Run>) {
+    while let Some(last) = line.last_mut() {
+        let trimmed = last.text.trim_end_matches(char::is_whitespace).len();
+        if trimmed == last.text.len() {
+            break;
+        }
+        last.text.truncate(trimmed);
+        if last.text.is_empty() {
+            line.pop();
+        } else {
+            break;
+        }
+    }
 }
 
 fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
@@ -1976,7 +2188,7 @@ fn emit_runs_tracking_links(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::links::LinkTarget;
+    use crate::links::{LinkTarget, TableHit};
     use crate::theme::Theme;
 
     #[test]
@@ -2037,6 +2249,140 @@ mod tests {
             "table frame widths not equal: {:?}\nlines:\n{}",
             widths,
             frame_lines.join("\n"),
+        );
+    }
+
+    /// Render `src` with a specific table expansion state applied to the only
+    /// table in the document (id = the table block's source byte offset).
+    fn render_table(src: &str, width: u16, mutate: impl FnOnce(&mut TableExpand)) -> Rendered {
+        // First render to discover the table's id from its hit-test region.
+        let probe = render(src, None, width, &Theme::dark());
+        let id = probe.table_map.regions[0].id;
+        let mut tables = TableExpansions::new();
+        let mut st = TableExpand::default();
+        mutate(&mut st);
+        tables.insert(id, st);
+        render_with_edit(src, None, width, &Theme::dark(), None, &tables)
+    }
+
+    #[test]
+    fn table_truncates_overflowing_cell_by_default() {
+        let src = "\
+| Name | Note |\n\
+| --- | --- |\n\
+| a | this is a long note that overflows the column badly |\n";
+        let r = render(src, None, 30, &Theme::dark());
+        let body: String = r.lines.iter().map(|l| line_text_of(l)).collect();
+        assert!(body.contains('…'), "expected an ellipsis from truncation");
+        // One body row → exactly one physical body line.
+        assert_eq!(r.table_map.regions[0].body_rows.len(), 1);
+        let (s, e) = r.table_map.regions[0].body_rows[0];
+        assert_eq!(e - s, 1, "unexpanded body row should be a single line");
+    }
+
+    fn line_text_of(l: &Line<'static>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn expanding_cell_wraps_it_across_multiple_lines() {
+        let src = "\
+| Name | Note |\n\
+| --- | --- |\n\
+| a | this is a long note that overflows the column badly |\n";
+        let base = render(src, None, 30, &Theme::dark());
+        let base_rows = base.lines.len();
+        let r = render_table(src, 30, |st| {
+            st.cells.insert((0, 1));
+        });
+        assert!(
+            r.lines.len() > base_rows,
+            "expanded cell should add lines ({} vs {})",
+            r.lines.len(),
+            base_rows
+        );
+        let full: String = r.lines.iter().map(line_text_of).collect();
+        // The cell wraps across physical lines, so the words appear but split;
+        // the tail word "badly" must survive and nothing is truncated.
+        assert!(
+            !full.contains('…'),
+            "expanded cell must not truncate:\n{full}"
+        );
+        assert!(
+            full.contains("badly"),
+            "full cell text should be visible when expanded:\n{full}"
+        );
+        // The expanded body row now spans multiple physical lines.
+        let (s, e) = r.table_map.regions[0].body_rows[0];
+        assert!(e - s > 1, "expanded row should span multiple lines");
+    }
+
+    #[test]
+    fn expanding_whole_table_shows_all_content() {
+        let src = "\
+| Name | Note |\n\
+| --- | --- |\n\
+| a | this is a long note that overflows the column badly |\n";
+        let r = render_table(src, 30, |st| st.all = true);
+        let full: String = r.lines.iter().map(line_text_of).collect();
+        assert!(!full.contains('…'), "no truncation when fully expanded");
+        assert!(full.contains("badly"));
+    }
+
+    #[test]
+    fn expanding_column_reclaims_natural_width() {
+        // A date column gets squeezed at narrow widths; expanding it should
+        // restore enough room to show the full date.
+        let src = "\
+| When | Description |\n\
+| --- | --- |\n\
+| 2026-05-30 | some descriptive text that eats the available width here |\n";
+        let narrow = render(src, None, 24, &Theme::dark());
+        let narrow_txt: String = narrow.lines.iter().map(line_text_of).collect();
+        assert!(
+            !narrow_txt.contains("2026-05-30"),
+            "date should be truncated at narrow width:\n{narrow_txt}"
+        );
+        let r = render_table(src, 24, |st| {
+            st.cols.insert(0);
+        });
+        let txt: String = r.lines.iter().map(line_text_of).collect();
+        assert!(
+            txt.contains("2026-05-30"),
+            "expanded date column should show the full date:\n{txt}"
+        );
+    }
+
+    #[test]
+    fn table_hit_test_classifies_clicks() {
+        let src = "\
+| Name | Note |\n\
+| --- | --- |\n\
+| a | bee |\n";
+        let r = render(src, None, 80, &Theme::dark());
+        let reg = &r.table_map.regions[0];
+        // A vertical border column → whole-table toggle.
+        let border_col = reg.border_x[0];
+        assert_eq!(
+            r.table_map.hit(reg.header_start, border_col),
+            Some((reg.id, TableHit::All))
+        );
+        // A top horizontal border line → whole-table toggle.
+        assert_eq!(
+            r.table_map.hit(reg.line_start, reg.col_x[0].0),
+            Some((reg.id, TableHit::All))
+        );
+        // Header cell content → column toggle.
+        let (cs, _) = reg.col_x[1];
+        assert_eq!(
+            r.table_map.hit(reg.header_start, cs),
+            Some((reg.id, TableHit::Column(1)))
+        );
+        // Body cell content → that cell.
+        let (bs, _) = reg.body_rows[0];
+        assert_eq!(
+            r.table_map.hit(bs, reg.col_x[0].0),
+            Some((reg.id, TableHit::Cell(0, 0)))
         );
     }
 
