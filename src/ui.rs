@@ -1085,6 +1085,29 @@ fn compute_middle(app: &App) -> Mid {
             }
         }
     }
+    // An active mouse hover over a link shows its target immediately — even
+    // over a sticky status message ("Opened …", "Copied …", "File reloaded").
+    // Hovering is a live gesture and the user wants feedback on what they're
+    // pointing at; moving the mouse away restores the status. Suppressed while
+    // editing or typing a search, which own the middle. Keyboard focus stays a
+    // lower-priority fallback below the status (see the link block further on).
+    if let View::Reader(r) = &app.view {
+        let busy = r.edit.is_some() || r.doc_search.as_ref().map(|s| s.editing).unwrap_or(false);
+        if !busy {
+            if let (Some(rendered), Some(hi)) = (r.rendered.as_ref(), r.hover_link) {
+                if let Some(link) = rendered.link_map.links.get(hi) {
+                    let visible_h = app.viewport.height as usize;
+                    let scroll = r.scroll as usize;
+                    let last_row_idx = scroll + visible_h.saturating_sub(1);
+                    let on_last_row = link.line == last_row_idx;
+                    return Mid::Url {
+                        text: describe_target(&link.target),
+                        on_last_row,
+                    };
+                }
+            }
+        }
+    }
     if !app.status.is_empty() {
         return Mid::Status(app.status.clone());
     }
@@ -1109,7 +1132,8 @@ fn compute_middle(app: &App) -> Mid {
             return Mid::Search(txt);
         }
         if let Some(rendered) = r.rendered.as_ref() {
-            // Hover wins; otherwise fall back to the focused link (if any).
+            // Active hover is handled earlier (it outranks a sticky status); here
+            // we fall back to the keyboard-focused link when nothing's hovered.
             let pick = r.hover_link.or_else(|| match r.focus {
                 Some(Focus::Link(i)) => Some(i),
                 _ => None,
@@ -1258,4 +1282,67 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" Help ");
     let para = Paragraph::new(body).block(block);
     f.render_widget(para, popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, Options, Source, View};
+    use crate::theme::Theme;
+
+    fn app_with_link() -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-ui-test-{}.md", std::process::id()));
+        std::fs::write(
+            &p,
+            "a paragraph with a [site](https://example.com/x) here\n",
+        )
+        .unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.ensure_rendered(80);
+        // compute_middle reads app.viewport.height to decide last-row edge case.
+        app.viewport = Rect::new(0, 0, 80, 24);
+        // Sanity: the rendered doc must contain exactly one link to hover.
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert_eq!(r.rendered.as_ref().unwrap().link_map.links.len(), 1);
+        app
+    }
+
+    // An active hover over a link must show the URL preview even when a sticky
+    // status message ("Opened …", "Copied …") is present — the live gesture
+    // wins. This is the regression the fix addresses.
+    #[test]
+    fn hover_url_outranks_sticky_status() {
+        let mut app = app_with_link();
+        app.status = "Copied: something".into();
+        if let View::Reader(r) = &mut app.view {
+            r.hover_link = Some(0);
+        }
+        match compute_middle(&app) {
+            Mid::Url { text, .. } => assert_eq!(text, "https://example.com/x"),
+            other => panic!("expected Url preview while hovering, got {:?}", other),
+        }
+    }
+
+    // With nothing hovered, the sticky status still shows (hover doesn't
+    // suppress it spuriously).
+    #[test]
+    fn status_shows_when_not_hovering() {
+        let mut app = app_with_link();
+        app.status = "Copied: something".into();
+        if let View::Reader(r) = &mut app.view {
+            r.hover_link = None;
+        }
+        match compute_middle(&app) {
+            Mid::Status(s) => assert_eq!(s, "Copied: something"),
+            other => panic!("expected status, got {:?}", other),
+        }
+    }
 }
