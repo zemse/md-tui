@@ -26,6 +26,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // (≤4/sec when idle, served from the kernel inode cache) — far
         // cheaper than a notification thread, and zero new dependencies.
         app.poll_external_change();
+        // Same idea for the browser: one stat of the listed directory per tick
+        // picks up files added/removed/renamed in it without a watcher thread.
+        app.poll_browser_change();
         term.draw(|f| ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;

@@ -310,6 +310,11 @@ pub struct Browser {
     pub entries: Vec<BrowserEntry>,
     pub selected: usize,
     pub scroll: u16,
+    /// Fingerprint of `dir` (mtime, size) at the last rebuild. A directory's
+    /// own stat changes when an entry is added, removed, or renamed in it, so
+    /// comparing this each tick tells us when the listing is stale — without a
+    /// file-watcher thread. `None` when the dir is gone or unstatable.
+    pub last_meta: Option<(std::time::SystemTime, u64)>,
 }
 
 #[derive(Clone)]
@@ -594,6 +599,28 @@ impl App {
         }
         self.status = "File reloaded".into();
         true
+    }
+
+    /// Cheap external-change check for the file browser, called every event-loop
+    /// tick. Stats the listed directory; if its (mtime, size) fingerprint moved
+    /// — an entry was added, removed, or renamed — the listing is rebuilt in
+    /// place (preserving the highlighted path when it survives). Returns `true`
+    /// when a rebuild happened. No-op outside the Browser view.
+    ///
+    /// Unread badges don't need this — `draw_browser` recomputes them from disk
+    /// every frame, so they're already live; only the entry list itself goes
+    /// stale, and that only changes when the directory's own stat changes.
+    pub fn poll_browser_change(&mut self) -> bool {
+        let View::Browser(b) = &mut self.view else {
+            return false;
+        };
+        let new_meta = file_meta(&b.dir);
+        if b.last_meta == new_meta {
+            return false;
+        }
+        // rebuild() refreshes last_meta, so a transient stat failure just retries
+        // next tick rather than looping.
+        b.rebuild().is_ok()
     }
 
     /// Flip the `[ ]`/`[x]` task marker at `idx` and persist to the source file.
@@ -2182,6 +2209,7 @@ impl Browser {
             entries: Vec::new(),
             selected: 0,
             scroll: 0,
+            last_meta: None,
         };
         b.rebuild()?;
         Ok(b)
@@ -2221,6 +2249,9 @@ impl Browser {
                 .unwrap_or(first_real),
             None => first_real,
         };
+        // Record the directory fingerprint this listing reflects, so the
+        // tick-driven poll only rebuilds when the dir actually changes.
+        self.last_meta = file_meta(&self.dir);
         Ok(())
     }
 
@@ -2612,6 +2643,40 @@ mod tests {
             !app.poll_external_change(),
             "no-op rewrite must not signal a reload"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poll_browser_change_rebuilds_when_dir_contents_change() {
+        let dir = fresh_temp("browser-watch");
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        // Steady-state tick is a no-op.
+        assert!(!app.poll_browser_change());
+        let count_before = match &app.view {
+            View::Browser(b) => b.entries.len(),
+            _ => panic!("expected browser view"),
+        };
+
+        // Drop a new file into the listed directory — the dir's own stat moves.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("b.md"), "# b").unwrap();
+
+        assert!(
+            app.poll_browser_change(),
+            "expected a rebuild after a file was added"
+        );
+        match &app.view {
+            View::Browser(b) => {
+                assert_eq!(b.entries.len(), count_before + 1);
+                assert!(b.entries.iter().any(|e| e.display == "b.md"));
+            }
+            _ => panic!("expected browser view"),
+        }
+        // No further changes → no further rebuild.
+        assert!(!app.poll_browser_change());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3072,6 +3137,7 @@ index abc..def 100644\n\
             }],
             selected: 0,
             scroll: 0,
+            last_meta: None,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
         // assert the fallback never out-of-bounds).
