@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, View};
+use crate::app::{self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, ReaderOrigin, View};
 use crate::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -150,6 +150,20 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     let total = rendered.lines.len();
     let scroll = (r.scroll as usize).min(total.saturating_sub(1));
     let visible_h = area.height as usize;
+
+    // Mark the file read once its last line is on screen. Documents shorter
+    // than the viewport satisfy this on open (nothing to scroll = read); longer
+    // ones require scrolling to the end. `mark_read` is idempotent, so calling
+    // it every frame while parked at the bottom is cheap. Not in edit mode —
+    // that's a separate draw path.
+    let mark_read_path = if r.edit.is_none() && r.scroll as usize + visible_h >= total {
+        match &r.origin {
+            ReaderOrigin::File(p) => Some(p.clone()),
+            ReaderOrigin::Stdin => None,
+        }
+    } else {
+        None
+    };
 
     let line_num_w = if app.opts.line_numbers {
         format!("{}", total).len() as u16 + 1
@@ -301,6 +315,13 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
                 cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+
+    // Last line is visible — record this file as read. Done after all `r`
+    // borrows above are out of scope so the disjoint `&mut app.read_state`
+    // borrow is clean.
+    if let Some(path) = mark_read_path {
+        app.read_state.mark_read(&path);
     }
 }
 
@@ -730,14 +751,27 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let badge_style = Style::default()
+        .fg(theme.heading[3])
+        .add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = b
         .entries
         .iter()
         .map(|e| {
-            ListItem::new(Span::styled(
-                e.display.clone(),
-                browser_entry_style(e.kind, theme),
-            ))
+            let name = Span::styled(e.display.clone(), browser_entry_style(e.kind, theme));
+            let unread = match e.kind {
+                BrowserEntryKind::Markdown => app.read_state.is_unread(&e.path),
+                BrowserEntryKind::Dir => app.read_state.dir_has_unread(&e.path),
+                BrowserEntryKind::ParentDir => false,
+            };
+            if unread {
+                ListItem::new(Line::from(vec![
+                    name,
+                    Span::styled(" [unread]", badge_style),
+                ]))
+            } else {
+                ListItem::new(name)
+            }
         })
         .collect();
     let list = List::new(items)

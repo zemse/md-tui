@@ -275,6 +275,25 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
 
+        // Browser only: mark the selected entry read. On a directory this marks
+        // every text file under it read recursively, clearing its `[unread]`
+        // badge (and those of its descendants). `../` is a deliberate no-op so
+        // the whole parent subtree can't be cleared by accident.
+        KeyCode::Char('r') => {
+            let target = if let View::Browser(b) = &app.view {
+                b.entries
+                    .get(b.selected)
+                    .filter(|e| !matches!(e.kind, BrowserEntryKind::ParentDir))
+                    .map(|e| e.path.clone())
+            } else {
+                None
+            };
+            if let Some(path) = target {
+                app.read_state.mark_read_recursive(&path);
+                app.read_state.flush();
+            }
+        }
+
         // Browser navigation arrows.
         KeyCode::Right => enter_or_open(app)?,
         KeyCode::Left => {

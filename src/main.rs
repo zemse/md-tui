@@ -5,6 +5,7 @@ mod jsonl;
 mod links;
 mod markdown;
 mod palette;
+mod read_state;
 mod syntax;
 mod theme;
 mod ui;
@@ -85,6 +86,7 @@ fn main() -> Result<()> {
     }));
 
     let res = events::run(&mut term, &mut app);
+    app.read_state.flush();
     ui::restore_terminal(&mut term)?;
     res
 }

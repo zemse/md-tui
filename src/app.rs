@@ -101,6 +101,8 @@ pub struct App {
     /// Both default to `Rect::default()` outside split-edit mode.
     pub edit_raw_area: Rect,
     pub edit_preview_area: Rect,
+    /// Machine-local read/unread tracking for the file browser.
+    pub read_state: crate::read_state::ReadState,
 }
 
 pub enum View {
@@ -352,6 +354,7 @@ pub struct SearchResult {
 impl App {
     pub fn new(source: Source, opts: Options) -> Result<Self> {
         let root = derive_root(&source);
+        let read_state = crate::read_state::ReadState::load(&root);
         let view = match source {
             Source::File(p) => View::Reader(Reader::from_file(&p)?),
             Source::Directory(d) => View::Browser(Browser::scan(&d)?),
@@ -388,6 +391,7 @@ impl App {
             image_protocols: HashMap::new(),
             edit_raw_area: Rect::default(),
             edit_preview_area: Rect::default(),
+            read_state,
         })
     }
 
