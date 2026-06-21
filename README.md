@@ -1,5 +1,8 @@
 # md
 
+> [!WARNING]
+> **Deprecated.** This project is no longer maintained. Use [zemse/hackmd](https://github.com/zemse/hackmd) instead.
+
 A terminal markdown reader with a built-in HackMD-style split editor.
 Built with Rust + [ratatui](https://ratatui.rs).
 
